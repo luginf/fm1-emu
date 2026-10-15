@@ -1,6 +1,6 @@
 //! Play the emulated FM-1 live.
 //!
-//!   fm1-live [--bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240]
+//!   fm1-live [--bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--fps 60]
 //!   fm1-live --bench 3000          # headless: how fast does it run?
 //!   fm1-live --fwsc FM-1.fwsc [--syx bank.syx]   # M-VAVE's stock firmware, from its package
 //!
@@ -58,6 +58,8 @@ struct Opts {
     midi: String,
     /// channel messages sent to this channel (1-16; 0 = as sent)
     midi_ch: u8,
+    /// window refresh rate (--fps)
+    fps: usize,
 }
 
 /// The firmware catalog web/firmwares.json as (id, name, version, image path): each image is
@@ -83,7 +85,7 @@ fn catalog() -> Vec<(String, String, String, String)> {
 fn parse() -> Option<Opts> {
     let a: Vec<String> = std::env::args().collect();
     let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
-                       name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0 };
+                       name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0, fps: 60 };
     let mut i = 1;
     while i < a.len() {
         match a[i].as_str() {
@@ -115,6 +117,7 @@ fn parse() -> Option<Opts> {
             "--midi-ch" => o.midi_ch = a.get(i + 1)?.parse().ok().filter(|c| *c <= 16)?,
             "--entry" => o.entry = u32::from_str_radix(a.get(i + 1)?.trim_start_matches("0x"), 16).ok()?,
             "--mhz" => o.mhz = a.get(i + 1)?.parse().ok()?,
+            "--fps" => o.fps = a.get(i + 1)?.parse().ok().filter(|f| (1..=240).contains(f))?,
             "--bench" => o.bench = Some(a.get(i + 1)?.parse().ok()?),
             "--shot" => o.shot = Some(a.get(i + 1)?.parse().ok()?),
             _ => return None,
@@ -650,7 +653,7 @@ const DRAG_PER_CLICK: f32 = 12.0;
 
 fn main() {
     let Some(o) = parse() else {
-        eprintln!("usage: fm1-live [--fw ID | --fw list | --bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--bench MS] [--midi all|none|NAME] [--midi-ch N]");
+        eprintln!("usage: fm1-live [--fw ID | --fw list | --bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--fps 60] [--bench MS] [--midi all|none|NAME] [--midi-ch N]");
         std::process::exit(2);
     };
     if let Some(ms) = o.shot {
@@ -779,7 +782,7 @@ fn main() {
             return;
         }
     };
-    win.set_target_fps(60);
+    win.set_target_fps(o.fps);
     let base = panel::base();
     let mut buf = vec![0u32; W * H];
     let mut fb: Vec<u16> = Vec::new();
@@ -939,7 +942,7 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
         Ok(w) => w,
         Err(e) => return eprintln!("window: {e:?}"),
     };
-    win.set_target_fps(60);
+    win.set_target_fps(o.fps);
     let base = panel_smk::base();
     let mut buf = vec![0u32; w * h];
     let mut fb: Vec<u16> = Vec::new();
