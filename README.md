@@ -108,6 +108,12 @@ cargo run --release -p fm1-live -- --fw felucca         # a window with the synt
 cargo run --release -p fm1-live -- --fwsc FM-1.fwsc     # M-VAVE's own, from its package
 ```
 
+The computer keyboard plays the notes (`A W S E D F T G Y H U J K O L P ; '` = C4..F5, `Z`/`X` octave,
+`Space` PLAY, `R` REC, `1`..`0` the buttons); `--layout azerty` moves them to the same places on an AZERTY
+keyboard (`Q Z S E D ... M`, `W`/`X` octave, `F1`..`F10` the buttons). **MIDI learn**: right-click a knob,
+a button or a key in the window, then move or press the control of your MIDI device that should drive it;
+the binding is kept (`~/.config/fm1-live/midi-map.txt`, or `--midi-map FILE`), `Del` forgets it.
+
 `fm1-live` runs the real 240 MHz clock on Apple silicon Macs (an AArch64 JIT) and on x86-64
 Linux (an x86-64 JIT); elsewhere it interprets (`--mhz` lowers the clock if that can't keep up, `--fps N` the window's refresh rate, 60 by default). It plays every MIDI input of the computer (`--midi NAME`, `--midi none`,
 `--midi-ch N`) and loads a DX7 bank into M-VAVE's firmware with `--syx bank.syx`.

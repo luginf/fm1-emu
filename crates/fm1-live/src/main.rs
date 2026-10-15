@@ -24,6 +24,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use fm1_core::{Bus, Cpu};
 use fm1_soc::{machine, Action, Soc, VEC_BASE};
 mod fetch;
+mod midilearn;
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use panel::{Ctl, ENCS, H, W};
 
@@ -63,13 +64,17 @@ struct Opts {
     fps: usize,
     /// where the downloaded firmwares are (--fw-dir)
     fw_dir: String,
+    /// the computer keyboard is AZERTY (--layout azerty)
+    azerty: bool,
+    /// where the MIDI learn bindings are kept (--midi-map)
+    midi_map: Option<String>,
 }
 
 fn parse() -> Option<Opts> {
     let a: Vec<String> = std::env::args().collect();
     let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
                        name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0, fps: 60,
-                       fw_dir: "reference/firmwares".into() };
+                       fw_dir: "reference/firmwares".into(), azerty: false, midi_map: None };
     // (before the rest, whatever the order: the directory the firmwares are in)
     if let Some(p) = a.iter().position(|x| x == "--fw-dir") {
         o.fw_dir = a.get(p + 1)?.clone();
@@ -125,6 +130,14 @@ fn parse() -> Option<Opts> {
             "--entry" => o.entry = u32::from_str_radix(a.get(i + 1)?.trim_start_matches("0x"), 16).ok()?,
             "--mhz" => o.mhz = a.get(i + 1)?.parse().ok()?,
             "--fw-dir" => o.fw_dir = a.get(i + 1)?.clone(),
+            "--layout" => {
+                o.azerty = match a.get(i + 1)?.to_lowercase().as_str() {
+                    "azerty" => true,
+                    "qwerty" => false,
+                    _ => return None,
+                }
+            }
+            "--midi-map" => o.midi_map = Some(a.get(i + 1)?.clone()),
             "--fps" => o.fps = a.get(i + 1)?.parse().ok().filter(|f| (1..=240).contains(f))?,
             "--bench" => o.bench = Some(a.get(i + 1)?.parse().ok()?),
             "--shot" => o.shot = Some(a.get(i + 1)?.parse().ok()?),
@@ -594,29 +607,57 @@ fn shot(o: &Opts, ms: u64) {
 
 // ---------------------------------------------------------------- input --
 
-fn piano(k: Key) -> Option<u8> {
+/// The note keys: C4..F5 on the keys A W S E D F T G Y H U J K O L P ; ' of a QWERTY keyboard.
+/// minifb reports the letter a key makes in the layout, so an AZERTY keyboard needs its own
+/// letters for the same places (Q Z S E D F T G Y H U J K O L P M; the key after M makes `ù`,
+/// which minifb has no name for: the last note, F5, is left out).
+fn piano(k: Key, azerty: bool) -> Option<u8> {
     // C4 = note key 7 = matrix id 21
-    let semis = match k {
-        Key::A => 0, Key::W => 1, Key::S => 2, Key::E => 3, Key::D => 4, Key::F => 5, Key::T => 6,
-        Key::G => 7, Key::Y => 8, Key::H => 9, Key::U => 10, Key::J => 11, Key::K => 12, Key::O => 13,
-        Key::L => 14, Key::P => 15, Key::Semicolon => 16, Key::Apostrophe => 17,
+    let semis = match (k, azerty) {
+        (Key::A, false) | (Key::Q, true) => 0,
+        (Key::W, false) | (Key::Z, true) => 1,
+        (Key::S, _) => 2,
+        (Key::E, _) => 3,
+        (Key::D, _) => 4,
+        (Key::F, _) => 5,
+        (Key::T, _) => 6,
+        (Key::G, _) => 7,
+        (Key::Y, _) => 8,
+        (Key::H, _) => 9,
+        (Key::U, _) => 10,
+        (Key::J, _) => 11,
+        (Key::K, _) => 12,
+        (Key::O, _) => 13,
+        (Key::L, _) => 14,
+        (Key::P, _) => 15,
+        (Key::Semicolon, false) | (Key::M, true) => 16,
+        (Key::Apostrophe, false) => 17,
         _ => return None,
     };
     Some(21 + semis)
 }
-
-fn button(k: Key) -> Option<u8> {
-    Some(match k {
-        Key::Z => 0, Key::X => 1, Key::Space => 12, Key::R => 13,
-        Key::Key1 => 2, Key::Key2 => 3, Key::Key3 => 4, Key::Key4 => 5, Key::Key5 => 6,
-        Key::Key6 => 7, Key::Key7 => 8, Key::Key8 => 9, Key::Key9 => 10, Key::Key0 => 11,
+/// The buttons: Z X octave, Space PLAY, R REC, 1..0. On AZERTY the unshifted digit row makes
+/// symbols (& é " ' ( ...) minifb cannot name, so F1..F10 are the ten buttons, and W / X the octave.
+fn button(k: Key, azerty: bool) -> Option<u8> {
+    Some(match (k, azerty) {
+        (Key::Z, false) | (Key::W, true) => 0,
+        (Key::X, _) => 1,
+        (Key::Space, _) => 12,
+        (Key::R, _) => 13,
+        (Key::Key1, false) | (Key::F1, true) => 2,
+        (Key::Key2, false) | (Key::F2, true) => 3,
+        (Key::Key3, false) | (Key::F3, true) => 4,
+        (Key::Key4, false) | (Key::F4, true) => 5,
+        (Key::Key5, false) | (Key::F5, true) => 6,
+        (Key::Key6, false) | (Key::F6, true) => 7,
+        (Key::Key7, false) | (Key::F7, true) => 8,
+        (Key::Key8, false) | (Key::F8, true) => 9,
+        (Key::Key9, false) | (Key::F9, true) => 10,
+        (Key::Key0, false) | (Key::F10, true) => 11,
         _ => return None,
     })
 }
-
-/// Connect the MIDI inputs `--midi` asks for: their bytes go to the MIDI IN jack. The
-/// connections live as long as the returned value.
-fn midi_inputs(o: &Opts, tx: &mpsc::Sender<Action>) -> Vec<midir::MidiInputConnection<()>> {
+fn midi_inputs(o: &Opts, tx: &mpsc::Sender<Action>, learn: &Arc<midilearn::Learn>) -> Vec<midir::MidiInputConnection<()>> {
     let mut conns = Vec::new();
     if o.midi == "none" {
         return conns;
@@ -635,8 +676,12 @@ fn midi_inputs(o: &Opts, tx: &mpsc::Sender<Action>) -> Vec<midir::MidiInputConne
         }
         let Ok(mut input) = midir::MidiInput::new("fm1-live") else { continue };
         input.ignore(midir::Ignore::None);
-        let (tx, ch) = (tx.clone(), o.midi_ch);
+        let (tx, ch, learn) = (tx.clone(), o.midi_ch, learn.clone());
         let got = input.connect(&port, "fm1-live in", move |_, msg, _| {
+            // (a bound control, or a control being learned, does not go on to the firmware)
+            if learn.handle(msg, &tx) {
+                return;
+            }
             for (i, &b) in msg.iter().enumerate() {
                 let b = if i == 0 && ch != 0 && (0x80..0xf0).contains(&b) { (b & 0xf0) | (ch - 1) } else { b };
                 let _ = tx.send(Action::Midi { b });
@@ -661,7 +706,7 @@ const DRAG_PER_CLICK: f32 = 12.0;
 
 fn main() {
     let Some(o) = parse() else {
-        eprintln!("usage: fm1-live [--fetch [ID ...]] [--fw ID | --fw list | --bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--fps 60] [--fw-dir DIR] [--bench MS] [--midi all|none|NAME] [--midi-ch N]");
+        eprintln!("usage: fm1-live [--fetch [ID ...]] [--fw ID | --fw list | --bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--fps 60] [--fw-dir DIR] [--layout qwerty|azerty] [--midi-map FILE] [--bench MS] [--midi all|none|NAME] [--midi-ch N]");
         std::process::exit(2);
     };
     if let Some(ms) = o.shot {
@@ -698,7 +743,8 @@ fn main() {
     let status = Arc::new(Mutex::new(String::from("booting")));
     let quit = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Action>();
-    let _midi = midi_inputs(&o, &tx);
+    let learn = Arc::new(midilearn::Learn::load(o.midi_map.as_ref().map(std::path::PathBuf::from).or_else(midilearn::default_path)));
+    let _midi = midi_inputs(&o, &tx, &learn);
 
     let audio_ok = _stream.is_some();
     let emu = {
@@ -803,8 +849,14 @@ fn main() {
     let mut was_pressed = false;
     let (mut last_y, mut drag_acc) = (0f32, 0f32);
     let mut last_title = Instant::now();
+    let (mut was_rpressed, mut shown_armed) = (false, None);
     eprintln!("mouse: click/drag the keys, click buttons, drag or scroll the knobs (MASTER = volume)");
-    eprintln!("keys: A W S E D F T G Y H U J K O L P ; ' = C4..F5, Z/X OCT, Space PLAY, R REC, 1..0 buttons, arrows and , . for SELECT/PRESETS/ALGORITHM; Esc quits");
+    if o.azerty {
+        eprintln!("keys (AZERTY): Q Z S E D F T G Y H U J K O L P M = C4..E5, W/X OCT, Space PLAY, R REC, F1..F10 buttons, arrows and , ; for SELECT/PRESETS/ALGORITHM; Esc quits");
+    } else {
+        eprintln!("keys: A W S E D F T G Y H U J K O L P ; ' = C4..F5, Z/X OCT, Space PLAY, R REC, 1..0 buttons, arrows and , . for SELECT/PRESETS/ALGORITHM; Esc quits");
+    }
+    eprintln!("MIDI learn: right-click a control, then move or press the one on your MIDI device (Del forgets it); {} bound", learn.count());
 
     while win.is_open() && !win.is_key_down(Key::Escape) {
         let turn = |i: usize, clicks: i32, enc_clicks: &mut [i32; 7], turning: &mut [u32; 8]| {
@@ -879,10 +931,30 @@ fn main() {
         }
         was_pressed = pressed;
 
+        // ---- MIDI learn: right-click a control to arm it, Del / Backspace forgets its binding
+        let rpressed = win.get_mouse_down(MouseButton::Right);
+        if rpressed && !was_rpressed {
+            if let Some((mx, my)) = pos {
+                let t = match panel::hit(mx, my) {
+                    Some(Ctl::Enc(i)) => Some(midilearn::Target::Enc(i)),
+                    Some(Ctl::Pot) => Some(midilearn::Target::Pot),
+                    Some(Ctl::Btn(id) | Ctl::Key(id)) => Some(midilearn::Target::Key(id)),
+                    None => None,
+                };
+                if let Some(t) = t {
+                    learn.toggle(t);
+                }
+            }
+        }
+        was_rpressed = rpressed;
+        if learn.armed().is_some() && (win.is_key_pressed(Key::Delete, KeyRepeat::No) || win.is_key_pressed(Key::Backspace, KeyRepeat::No)) {
+            learn.forget_armed();
+        }
+
         // ---- held keys and buttons: computer keyboard + mouse
         let mut want = [false; 41];
         for k in win.get_keys() {
-            if let Some(id) = piano(k).or_else(|| button(k)) {
+            if let Some(id) = piano(k, o.azerty).or_else(|| button(k, o.azerty)) {
                 want[id as usize] = true;
             }
         }
@@ -902,7 +974,8 @@ fn main() {
                 Key::Down => turn(1, -1, &mut enc_clicks, &mut turning),
                 Key::Up => turn(1, 1, &mut enc_clicks, &mut turning),
                 Key::Comma => turn(2, -1, &mut enc_clicks, &mut turning),
-                Key::Period => turn(2, 1, &mut enc_clicks, &mut turning),
+                Key::Period if !o.azerty => turn(2, 1, &mut enc_clicks, &mut turning),
+                Key::Semicolon if o.azerty => turn(2, 1, &mut enc_clicks, &mut turning),
                 _ => {}
             }
         }
@@ -931,8 +1004,14 @@ fn main() {
         if win.update_with_buffer(&buf, W, H).is_err() {
             break;
         }
-        if last_title.elapsed() >= Duration::from_millis(500) {
-            win.set_title(&format!("FM-1 · {} — {}", o.name, status.lock().unwrap()));
+        let armed = learn.armed();
+        if armed != shown_armed || last_title.elapsed() >= Duration::from_millis(500) {
+            let l = match armed {
+                Some(t) => format!(" | MIDI LEARN {}: move or press a control (was: {}), Del forgets", t.describe(), learn.bound_to(t).unwrap_or_else(|| "none".into())),
+                None => String::new(),
+            };
+            win.set_title(&format!("FM-1 · {} — {}{l}", o.name, status.lock().unwrap()));
+            shown_armed = armed;
             last_title = Instant::now();
         }
     }
@@ -1035,7 +1114,7 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
         let mut want = [false; 64];
         let mut pad_keys = [false; 8];
         for k in win.get_keys() {
-            if let Some(id) = piano(k) {
+            if let Some(id) = piano(k, o.azerty) {
                 want[(id - 21 + 12) as usize] = true; // (piano() gives the FM-1's ids, C4 = 21)
             }
             let b = match k { Key::Z => Some(4), Key::X => Some(5), Key::Space => Some(16), Key::R => Some(17), _ => None };
@@ -1072,7 +1151,8 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
                 Key::Down => turn(1, -1, &mut enc_clicks, &mut turning),
                 Key::Up => turn(1, 1, &mut enc_clicks, &mut turning),
                 Key::Comma => turn(2, -1, &mut enc_clicks, &mut turning),
-                Key::Period => turn(2, 1, &mut enc_clicks, &mut turning),
+                Key::Period if !o.azerty => turn(2, 1, &mut enc_clicks, &mut turning),
+                Key::Semicolon if o.azerty => turn(2, 1, &mut enc_clicks, &mut turning),
                 _ => {}
             }
         }
