@@ -331,6 +331,20 @@ fn bench(o: &Opts, ms: u64) {
     );
 }
 
+/// The window. On X11 the window's input context needs the input method `XMODIFIERS` names
+/// (`@im=ibus`, `@im=fcitx`); without that service running, minifb's XOpenIM fails and so does
+/// the window. Then the window is opened again without an input method (the keys work the same).
+fn open_window(title: &str, w: usize, h: usize, opts: impl Fn() -> WindowOptions) -> Result<Window, minifb::Error> {
+    match Window::new(title, w, h, opts()) {
+        Err(e) if std::env::var_os("XMODIFIERS").is_some_and(|v| !v.is_empty()) => {
+            eprintln!("window: {e:?}; retrying without XMODIFIERS (no input method)");
+            std::env::remove_var("XMODIFIERS");
+            Window::new(title, w, h, opts())
+        }
+        r => r,
+    }
+}
+
 // ---------------------------------------------------------------- audio --
 
 struct AudioRing {
@@ -756,10 +770,10 @@ fn main() {
         let _ = emu.join();
         return;
     }
-    let mut win = match Window::new(&format!("FM-1 · {} (emulated)", o.name), W, H, WindowOptions::default()) {
+    let mut win = match open_window(&format!("FM-1 · {} (emulated)", o.name), W, H, WindowOptions::default) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("window: {e}");
+            eprintln!("window: {e:?}");
             quit.store(true, Ordering::Relaxed);
             let _ = emu.join();
             return;
@@ -914,9 +928,9 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
     use fm1_soc::smk::{ANALOG_MOD, ANALOG_PITCH, MOD_REST, PITCH_REST};
     use panel_smk::Ctl as S;
     let (w, h) = (panel_smk::W, panel_smk::H);
-    let mut win = match Window::new(&format!("SMK-37 · {} (emulated)", o.name), w, h, WindowOptions { resize: true, ..WindowOptions::default() }) {
+    let mut win = match open_window(&format!("SMK-37 · {} (emulated)", o.name), w, h, || WindowOptions { resize: true, ..WindowOptions::default() }) {
         Ok(w) => w,
-        Err(e) => return eprintln!("window: {e}"),
+        Err(e) => return eprintln!("window: {e:?}"),
     };
     win.set_target_fps(60);
     let base = panel_smk::base();
