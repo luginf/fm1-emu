@@ -1,4 +1,4 @@
-//! x86-64 (Linux) JIT for the blocks of micro-ops `Cpu::run_fast` interprets: the counterpart
+//! x86-64 (Linux and Windows) JIT for the blocks of micro-ops `Cpu::run_fast` interprets: the counterpart
 //! of the AArch64 JIT in `jit.rs`, which it follows op for op (same block / chain / tick
 //! discipline, same helpers), so the two read side by side. A compiled block is the block's
 //! plain prefix (up to the first op that needs the careful path) as native code, with the
@@ -19,6 +19,11 @@
 //! conversions) go through the interpreter's own executor (`h_op`): NaN and saturation rules
 //! stay its own, and those ops are rare.
 //!
+//! Two calling conventions: System V (Linux) and Win64 (Windows: arguments in rcx, rdx, r8, r9,
+//! 32 bytes of shadow space above the return address, rdi / rsi callee-saved). The generated
+//! code differs only in the prologue / epilogue and where a helper's arguments go (`call_read`,
+//! `call_write`, `call_op`); the frame keeps the shadow space and a 5th argument slot on Win64.
+//!
 //! Register plan (System V; only baseline x86-64, no BMI / AVX, so it runs on any x86-64 CPU):
 //!   r12 = &Cpu, r13 = &Ctx, r14 = RAM host base, r15 = XIP host base,
 //!   ebx = instructions done in this call before the current block, ebp = the limit
@@ -28,8 +33,12 @@
 //!   pc is stored at exit. rsp is 16-byte aligned in every body, so helpers may be called.
 
 use crate::jit_x64::{Alu, Asm, Cc, Label, Ld, Reg, Sh, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, R10, R11, R12, R13, R14, R15, R8};
+#[cfg(windows)]
+use crate::jit_x64::R9;
 use crate::{Base, Bus, Cond, Cpu, Fast, Op, RmwOp};
-use std::ffi::{c_int, c_void};
+use std::ffi::c_void;
+#[cfg(not(windows))]
+use std::ffi::c_int;
 
 /// Host view of the guest memory the inline paths read and write directly.
 #[derive(Clone, Copy, Debug)]
@@ -65,8 +74,14 @@ const _: () = assert!(std::mem::offset_of!(Ctx, brk) == OFF_BRK as usize);
 const _: () = assert!(std::mem::offset_of!(Ctx, slot) == OFF_SLOT as usize);
 
 // ------------------------------------------------------------------ executable memory
+#[cfg(not(windows))]
 extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
+}
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn VirtualAlloc(addr: *mut c_void, len: usize, alloc_type: u32, protect: u32) -> *mut c_void;
 }
 
 pub struct CodeCache {
@@ -77,9 +92,12 @@ pub struct CodeCache {
 
 impl CodeCache {
     pub fn new(size: usize) -> Option<CodeCache> {
-        let flags = 0x0002 | 0x0020; // MAP_PRIVATE | MAP_ANONYMOUS
         // SAFETY: anonymous mapping chosen by the OS; failure is checked.
-        let p = unsafe { mmap(std::ptr::null_mut(), size, 7, flags, -1, 0) }; // read, write, exec
+        #[cfg(not(windows))]
+        let p = unsafe { mmap(std::ptr::null_mut(), size, 7, 0x0002 | 0x0020, -1, 0) }; // read, write, exec; MAP_PRIVATE | MAP_ANONYMOUS
+        // SAFETY: as above (MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+        #[cfg(windows)]
+        let p = unsafe { VirtualAlloc(std::ptr::null_mut(), size, 0x3000, 0x40) };
         if p as isize == -1 || p.is_null() {
             return None;
         }
@@ -277,10 +295,21 @@ const W0: Reg = RAX;
 const W1: Reg = RCX;
 const W2: Reg = RDX;
 const W3: Reg = RSI;
-/// stack slots kept across a helper call (the frame: 2 slots + 1 spare, aligning rsp)
+/// stack slots kept across a helper call, and the frame (rsp stays 16-byte aligned: the pushes
+/// of the prologue leave it 8 off, the frame brings it back)
+#[cfg(not(windows))]
 const KEEP: i32 = 0;
+#[cfg(not(windows))]
 const KEEP2: i32 = 8;
+#[cfg(not(windows))]
 const FRAME: i32 = 24;
+// Win64: 32 bytes of shadow space, then the 5th argument of a call, then the two slots
+#[cfg(windows)]
+const KEEP: i32 = 40;
+#[cfg(windows)]
+const KEEP2: i32 = 48;
+#[cfg(windows)]
+const FRAME: i32 = 56;
 
 struct Gen<'a> {
     a: Asm,
@@ -408,6 +437,68 @@ impl Gen<'_> {
         self.a.mov(W0, DONE);
         self.a.jmp(self.exit);
     }
+    /// w0 = h_read(ctx, addr = w0, idx, w)
+    fn call_read(&mut self, idx: u32, w: u8) {
+        #[cfg(not(windows))]
+        {
+            // rdi, esi, edx, ecx
+            self.a.mov(W3, W0);
+            self.a.mov_q(RDI, CTX);
+            self.idx_to(W2, idx);
+            self.a.mov_i(W1, w as u32);
+        }
+        #[cfg(windows)]
+        {
+            // rcx, edx, r8d, r9d
+            self.a.mov(W2, W0);
+            self.a.mov_q(RCX, CTX);
+            self.idx_to(R8, idx);
+            self.a.mov_i(R9, w as u32);
+        }
+        self.call(self.h_read);
+    }
+    /// h_write(ctx, addr = w0, value = w1, idx, w)
+    fn call_write(&mut self, idx: u32, w: u8) {
+        #[cfg(not(windows))]
+        {
+            // rdi, esi, edx, ecx, r8d
+            self.a.mov(W2, W1);
+            self.a.mov(W3, W0);
+            self.a.mov_q(RDI, CTX);
+            self.idx_to(W1, idx);
+            self.a.mov_i(R8, w as u32);
+        }
+        #[cfg(windows)]
+        {
+            // rcx, edx, r8d, r9d, then the 5th on the stack just above the shadow space
+            self.a.mov(R8, W1);
+            self.a.mov(W2, W0);
+            self.a.mov_q(RCX, CTX);
+            self.idx_to(R9, idx);
+            self.a.st_i(RSP, 32, w as u32);
+        }
+        self.call(self.h_write);
+    }
+    /// rax = h_op(ctx, op, idx, next_pc)
+    fn call_op(&mut self, op: u64, idx: u32, next_pc: u32) {
+        #[cfg(not(windows))]
+        {
+            // rdi, rsi, edx, ecx
+            self.a.mov_q(RDI, CTX);
+            self.a.mov_i64(RSI, op);
+            self.idx_to(W2, idx);
+            self.a.mov_i(W1, next_pc);
+        }
+        #[cfg(windows)]
+        {
+            // rcx, rdx, r8d, r9d
+            self.a.mov_q(RCX, CTX);
+            self.a.mov_i64(RDX, op);
+            self.idx_to(R8, idx);
+            self.a.mov_i(R9, next_pc);
+        }
+        self.call(self.h_op);
+    }
     /// The helpers' instruction index of op `i` of this block: dst = DONE + i.
     fn idx_to(&mut self, dst: Reg, i: u32) {
         self.a.lea(dst, DONE, i as i32);
@@ -440,11 +531,7 @@ impl Gen<'_> {
             self.a.jmp(done);
         }
         self.a.bind(slow);
-        self.a.mov(W3, W0);
-        self.a.mov_q(RDI, CTX);
-        self.idx_to(W2, idx);
-        self.a.mov_i(W1, w as u32);
-        self.call(self.h_read);
+        self.call_read(idx, w);
         match (w, signed) {
             (2, true) => self.a.movsx16(W0, W0),
             (1, true) => self.a.movsx8(W0, W0),
@@ -468,13 +555,7 @@ impl Gen<'_> {
         self.a.st_idx(w, W1, RAM, W2);
         self.a.jmp(done);
         self.a.bind(slow);
-        // h_write(ctx, addr, value, idx, w): rdi, esi, edx, ecx, r8d
-        self.a.mov(W2, W1);
-        self.a.mov(W3, W0);
-        self.a.mov_q(RDI, CTX);
-        self.idx_to(W1, idx);
-        self.a.mov_i(R8, w as u32);
-        self.call(self.h_write);
+        self.call_write(idx, w);
         self.a.bind(done);
     }
 
@@ -519,17 +600,34 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u8
         h_write: h_write::<B> as usize as u64,
         h_op: h_op::<B> as usize as u64,
     };
-    // prologue (entry from Rust); chained blocks enter at the body. Arguments: rdi = cpu,
-    // rsi = ctx, rdx = ram, rcx = xip, r8d = limit.
-    for r in [RBX, RBP, R12, R13, R14, R15] {
-        g.a.push(r);
+    // prologue (entry from Rust); chained blocks enter at the body. Arguments: cpu, ctx, ram,
+    // xip, limit: rdi, rsi, rdx, rcx, r8d (System V); rcx, rdx, r8, r9, [stack] (Win64).
+    #[cfg(not(windows))]
+    {
+        for r in [RBX, RBP, R12, R13, R14, R15] {
+            g.a.push(r);
+        }
+        g.a.alu_i_q(Alu::Sub, RSP, FRAME);
+        g.a.mov_q(CPU, RDI);
+        g.a.mov_q(CTX, RSI);
+        g.a.mov_q(RAM, RDX);
+        g.a.mov_q(XIP, RCX);
+        g.a.mov(LIMIT, R8);
     }
-    g.a.alu_i_q(Alu::Sub, RSP, FRAME);
-    g.a.mov_q(CPU, RDI);
-    g.a.mov_q(CTX, RSI);
-    g.a.mov_q(RAM, RDX);
-    g.a.mov_q(XIP, RCX);
-    g.a.mov(LIMIT, R8);
+    #[cfg(windows)]
+    {
+        // (rdi and rsi are callee-saved on Win64, and the code uses them: 8 pushes)
+        for r in [RBX, RBP, RDI, RSI, R12, R13, R14, R15] {
+            g.a.push(r);
+        }
+        g.a.alu_i_q(Alu::Sub, RSP, FRAME);
+        g.a.mov_q(CPU, RCX);
+        g.a.mov_q(CTX, RDX);
+        g.a.mov_q(RAM, R8);
+        g.a.mov_q(XIP, R9);
+        // the 5th argument: above the return address (8) and the 32 bytes of shadow space
+        g.a.ld(LIMIT, RSP, FRAME + 8 * 8 + 8 + 32);
+    }
     g.a.mov_i(DONE, 0);
     let body = g.a.here();
     // the whole prefix must fit the call's limit, else back to Rust before running any of it
@@ -942,12 +1040,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u8
             // ---- everything else: the interpreter's executor for this one op
             other => {
                 let p: &'static Fast = Box::leak(Box::new(other));
-                // h_op(ctx, op, idx, next_pc): rdi, rsi, edx, ecx
-                g.a.mov_q(RDI, CTX);
-                g.a.mov_i64(RSI, p as *const Fast as u64);
-                g.idx_to(W2, idx);
-                g.a.mov_i(W1, next_pc);
-                g.call(g.h_op);
+                g.call_op(p as *const Fast as u64, idx, next_pc);
                 let fall = g.a.label();
                 g.a.bt_q_i(RAX, 32); // bit 32: jumped (eax holds the target)
                 g.a.jcc(Cc::Ae, fall); // (carry clear)
@@ -980,7 +1073,12 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u8
     }
     g.a.bind(exit);
     g.a.alu_i_q(Alu::Add, RSP, FRAME);
+    #[cfg(not(windows))]
     for r in [R15, R14, R13, R12, RBP, RBX] {
+        g.a.pop(r);
+    }
+    #[cfg(windows)]
+    for r in [R15, R14, R13, R12, RSI, RDI, RBP, RBX] {
         g.a.pop(r);
     }
     g.a.ret();

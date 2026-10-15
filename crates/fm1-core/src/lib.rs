@@ -23,17 +23,17 @@ use fm1_isa::{DecodeError, Instruction, SlotKind};
 mod jit;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod jit_a64;
-#[cfg(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", target_os = "linux")))]
+#[cfg(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows"))))]
 pub use jit::JitMem;
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
 mod jit_x64;
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
 #[path = "jit_x86.rs"]
 mod jit;
 #[cfg(target_arch = "wasm32")]
 pub mod jit_wasm;
 /// (no JIT on this host: the type exists so buses compile everywhere)
-#[cfg(not(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", target_os = "linux"))))]
+#[cfg(not(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))))]
 #[derive(Clone, Copy, Debug)]
 pub struct JitMem {
     pub ram: *mut u8,
@@ -196,7 +196,7 @@ pub struct Cpu {
     pub icache_x: Vec<Option<LineX>>,
     /// Compile hot blocks to native code (AArch64 macOS hosts).
     pub jit_on: bool,
-    #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", target_os = "linux")))]
+    #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows"))))]
     jit: Option<Box<jit::Jit>>,
     /// (the wasm32 build: hot blocks as WebAssembly modules, see jit_wasm.rs)
     #[cfg(target_arch = "wasm32")]
@@ -412,7 +412,7 @@ impl Cpu {
                 sync!();
                 return Ok((n, false));
             };
-            #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", target_os = "linux")))]
+            #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows"))))]
             if self.jit_on && !careful {
                 if let Some(mem) = jit_mem {
                     if self.jit.is_none() {
@@ -487,7 +487,7 @@ impl Cpu {
                     }
                 }
             }
-            #[cfg(not(any(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", target_os = "linux")), target_arch = "wasm32")))]
+            #[cfg(not(any(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows"))), target_arch = "wasm32")))]
             let _ = (id, &jit_mem);
             for i in start..start + len {
                 // SAFETY: build_block pushed start..start+len into bops and
@@ -649,7 +649,7 @@ impl Cpu {
     }
 
     /// The compiled body of the block starting at pc, if there is one.
-    #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", target_os = "linux")))]
+    #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows"))))]
     fn jit_body_at(&self, pc: u32) -> Option<*const u8> {
         // RAM blocks are entered only through block_at, which checks their bytes first
         if self.bmap.is_empty() || !(0x0200_0000..0x0400_0000).contains(&pc) {
@@ -676,7 +676,7 @@ impl Cpu {
             #[cfg(target_arch = "wasm32")]
             self.bver.clear();
             self.bmap.iter_mut().for_each(|x| *x = 0);
-            #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", target_os = "linux")))]
+            #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows"))))]
             if let Some(j) = self.jit.as_mut() {
                 j.reset();
             }

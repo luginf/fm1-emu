@@ -54,6 +54,29 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} -p fm1-live -p fm1-emu
 
+      # The x86-64 JIT must give the interpreter's audio, on this very OS (System V on Linux,
+      # Win64 on Windows): a firmware is downloaded by fm1-live itself and run both ways.
+      - name: JIT check
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          EXE=target/${{ matrix.target }}/release/fm1-live
+          [ "$RUNNER_OS" = "Windows" ] && EXE=$EXE.exe
+          PY=python3; command -v python3 >/dev/null || PY=python
+          for id in felucca x0x sloop; do
+            FM1_BENCH_WAV=jit.raw "$EXE" --fw $id --midi none --bench 1500
+            FM1_NO_JIT=1 FM1_BENCH_WAV=nojit.raw "$EXE" --fw $id --midi none --bench 1500
+            $PY -c "
+          a = open('jit.raw', 'rb').read()
+          b = open('nojit.raw', 'rb').read()
+          n = min(len(a), len(b))
+          assert n > 100000, ('no audio', n)
+          assert abs(len(a) - len(b)) <= 4096, ('lengths', len(a), len(b))
+          assert a[:n] == b[:n], 'JIT audio differs from the interpreter'
+          print('$id: JIT audio identical over', n, 'bytes')
+          "
+          done
+
       - name: Package
         shell: bash
         run: |

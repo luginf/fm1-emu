@@ -129,7 +129,7 @@ a button or a key in the window, then move or press the control of your MIDI dev
 the binding is kept (`~/.config/fm1-live/midi-map.txt`, or `--midi-map FILE`), `Del` forgets it.
 
 `fm1-live` runs the real 240 MHz clock on Apple silicon Macs (an AArch64 JIT) and on x86-64
-Linux (an x86-64 JIT); elsewhere it interprets (`--mhz` lowers the clock if that can't keep up, `--fps N` the window's refresh rate, 60 by default). It plays every MIDI input of the computer (`--midi NAME`, `--midi none`,
+Linux and Windows (an x86-64 JIT); elsewhere it interprets (`--mhz` lowers the clock if that can't keep up, `--fps N` the window's refresh rate, 60 by default). It plays every MIDI input of the computer (`--midi NAME`, `--midi none`,
 `--midi-ch N`) and loads a DX7 bank into M-VAVE's firmware with `--syx bank.syx`.
 `fm1-emu` is the batch runner for tests and debugging (WAV and screen output, breakpoints,
 memory dumps).
