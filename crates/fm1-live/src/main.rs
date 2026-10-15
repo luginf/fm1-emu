@@ -1027,10 +1027,10 @@ fn main() {
         }
         // MIDI learn: a thin frame on what is bound, a thick orange one on what is being learned
         for t in learn.bound_targets() {
-            panel::frame(&mut buf, t, 0xff40_c0ff, 2);
+            midilearn::frame(&mut buf, t, 0xff40_c0ff, 2);
         }
         if let Some(t) = learn.armed() {
-            panel::frame(&mut buf, t, 0xffff_9020, 5);
+            midilearn::frame(&mut buf, t, 0xffff_9020, 5);
         }
         if win.update_with_buffer(&buf, W, H).is_err() {
             break;

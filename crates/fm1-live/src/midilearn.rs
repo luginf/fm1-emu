@@ -241,6 +241,49 @@ impl Inner {
     }
 }
 
+/// A frame around a control (MIDI learn: orange and thick for the one being learned, thin for
+/// those already bound): a ring around a knob, a rectangle around a button or a key.
+pub fn frame(buf: &mut [u32], t: Target, color: u32, thick: usize) {
+    use crate::panel::{buttons, keys, ENCS, H, POT, W};
+    let mut put = |x: i32, y: i32| {
+        if (0..W as i32).contains(&x) && (0..H as i32).contains(&y) {
+            buf[y as usize * W + x as usize] = color;
+        }
+    };
+    let mut ring = |cx: f32, cy: f32, r: f32| {
+        let (outer, inner) = (r + 6.0 + thick as f32, r + 6.0);
+        for y in (cy - outer) as i32..=(cy + outer) as i32 {
+            for x in (cx - outer) as i32..=(cx + outer) as i32 {
+                let d2 = (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2);
+                if d2 <= outer * outer && d2 >= inner * inner {
+                    put(x, y);
+                }
+            }
+        }
+    };
+    match t {
+        Target::Enc(i) => {
+            let (_, _, cx, cy, r) = ENCS[i];
+            ring(cx, cy, r);
+        }
+        Target::Pot => ring(POT.0, POT.1, POT.2),
+        Target::Key(id) => {
+            let rect = buttons().into_iter().find(|b| b.1 == id).map(|b| (b.2, b.3, b.4, b.5)).or_else(|| keys().into_iter().find(|k| k.0 == id).map(|k| (k.1, k.2, k.3, k.4)));
+            if let Some((x, y, w, h)) = rect {
+                let (x0, y0, x1, y1) = (x as i32 - thick as i32, y as i32 - thick as i32, (x + w) as i32 + thick as i32, (y + h) as i32 + thick as i32);
+                for yy in y0..y1 {
+                    for xx in x0..x1 {
+                        let inside = xx >= x as i32 && xx < (x + w) as i32 && yy >= y as i32 && yy < (y + h) as i32;
+                        if !inside {
+                            put(xx, yy);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
