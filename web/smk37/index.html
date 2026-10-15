@@ -155,9 +155,11 @@
 
     <section id="stock" aria-labelledby="h-stock">
       <h2 id="h-stock">M-VAVE's own firmware</h2>
-      <p>The firmware the SMK-37 ships with unpacks and boots here, but its screen stays dark: its drivers use more of
-        the board than the community firmwares do, and that part of the emulator is not done. To try it, download
-        <code>SMK-37 Pro_016.fwsc</code> from
+      <p>The firmware the SMK-37 ships with runs here as the MIDI controller it is: its screen, buttons, pads and keys
+        work. Press PATCH and play a chord, and it names the chord on its screen. No sound comes out: its notes go to
+        USB and Bluetooth MIDI, which are not emulated. It is also interrupt-heavy (its key scan alone is ~120 000
+        interrupts a second) and runs at about 0.6× real time in the browser so far.</p>
+      <p>To try it, download <code>SMK-37 Pro_016.fwsc</code> from
         <a href="https://yms-file-store.oss-cn-hongkong.aliyuncs.com/software/firmware/SMK-37Pro/SMK-37%20Pro_016.fwsc">M-VAVE</a>,
         choose “M-VAVE stock firmware” and click <b>Open .fwsc…</b>.</p>
     </section>
@@ -170,7 +172,7 @@
         <li><b>Speed.</b> As on the FM-1 page: the status line shows the load, and a device that can't keep up gets
           a warning with a lower clock.</li>
         <li><b>MIDI out</b> (the TRS jack) and USB MIDI are not emulated.</li>
-        <li><b>M-VAVE's own firmware</b> does not run yet (above).</li>
+        <li><b>M-VAVE's own firmware</b> makes no sound here and runs slower than real time in the browser (above).</li>
       </ul>
     </section>
 

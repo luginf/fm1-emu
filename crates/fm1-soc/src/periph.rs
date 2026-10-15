@@ -182,9 +182,19 @@ pub struct Periph {
     tick_pending: bool,
     /// SPI1 finished a transfer with its interrupt enabled (CON bit 13); CON bit 14 clears.
     pub spi1_pending: bool,
+    /// SMK-37: the cycle SPI1's transfer in progress ends at (CON's done bit reads set from
+    /// then), and its interrupt's (u64::MAX: none). Its stock firmware redraws as often as the
+    /// screen's DMA lets it: finishing at once, ~185 frames a second through the LCD model.
+    pub spi1_done_at: u64,
+    spi1_irq_at: u64,
     /// SARADC: a conversion finished (CON bit 7), and its IRQ 24 when CON bit 5 enabled it.
     adc_done: bool,
     adc_irq: bool,
+    /// SMK-37: the cycle a conversion in progress finishes at (u64::MAX: none). Its stock
+    /// firmware chains conversions through IRQ 24 (each handler starts the next): finishing at
+    /// once, the next interrupt was due as the handler returned, ~2.4 M a second, and the main
+    /// code never ran.
+    adc_next: u64,
     /// SPI2 finished a transfer with its interrupt enabled (the stock key scan), and when
     /// the transfer under way finishes.
     pub spi2_pending: bool,
@@ -273,8 +283,11 @@ impl Default for Periph {
             tick_next: u64::MAX,
             tick_pending: false,
             spi1_pending: false,
+            spi1_done_at: 0,
+            spi1_irq_at: u64::MAX,
             adc_done: false,
             adc_irq: false,
+            adc_next: u64::MAX,
             spi2_pending: false,
             spi2_next: u64::MAX,
             tmr: [Tmr { next: u64::MAX, ..Default::default() }; 4],
@@ -357,7 +370,7 @@ impl Periph {
 
     /// The next cycle at which something timed happens.
     fn next_event(&self) -> u64 {
-        let mut n = self.t5_next.min(self.alnk_next).min(self.tick_next).min(self.spi2_next);
+        let mut n = self.t5_next.min(self.alnk_next).min(self.tick_next).min(self.spi2_next).min(self.adc_next).min(self.spi1_irq_at);
         n = n.min(self.uart.next).min(self.uart.ot_next);
         for t in &self.tmr {
             n = n.min(t.next);
@@ -391,6 +404,15 @@ impl Periph {
         if self.cycles >= self.spi2_next {
             self.spi2_pending = true;
             self.spi2_next = u64::MAX;
+        }
+        if self.cycles >= self.spi1_irq_at {
+            self.spi1_irq_at = u64::MAX;
+            self.spi1_pending = true;
+        }
+        if self.cycles >= self.adc_next {
+            self.adc_next = u64::MAX;
+            self.adc_done = true;
+            self.adc_irq = self.adc_con & 0x20 != 0;
         }
         for i in 0..4 {
             if self.cycles >= self.tmr[i].next {
@@ -790,12 +812,18 @@ impl Periph {
                 // without bit 4 acknowledges (`CON = 0x40`).
                 if v & 0x40 != 0 {
                     if v & 0x10 != 0 {
-                        self.adc_done = true;
-                        self.adc_irq = v & 0x20 != 0;
-                        // SMK-37: sampled now, from the mux address latched now
                         if self.board == crate::Board::Smk37 {
+                            // SMK-37: sampled now, from the mux address latched now; done ~40 us
+                            // later (the hardware map's SMK timing), IRQ 24 then if enabled
                             let ch = (v >> 8) & 0xf;
                             self.adc_sample = self.smk.adc(ch).unwrap_or(self.adc_value[ch as usize]);
+                            self.adc_done = false;
+                            self.adc_irq = false;
+                            self.adc_next = self.cycles + (self.hz / 25_000).max(1);
+                            self.next_due = 0;
+                        } else {
+                            self.adc_done = true;
+                            self.adc_irq = v & 0x20 != 0;
                         }
                     } else {
                         self.adc_done = false;
@@ -938,6 +966,18 @@ impl Periph {
         if next != u64::MAX && next > self.cycles + 1 {
             self.skipped += next - 1 - self.cycles;
             self.cycles = next - 1;
+            self.next_due = 0;
+        }
+    }
+
+    /// SMK-37: an SPI1 transfer of `bytes` started at BAUD `baud` (the clock 60 MHz / (baud + 1):
+    /// ~12 MHz at 4 for the LCD, 6.67 MHz at 8 for the pad LEDs); with `irq` IRQ 16 at its end.
+    pub fn spi1_start(&mut self, bytes: u32, baud: u32, irq: bool) {
+        let clk = 60_000_000 / (baud as u64 + 1);
+        let dur = (bytes.max(1) as u64 * 8 * self.hz / clk).max(1);
+        self.spi1_done_at = self.cycles + dur;
+        if irq {
+            self.spi1_irq_at = self.spi1_done_at;
             self.next_due = 0;
         }
     }

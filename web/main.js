@@ -212,7 +212,7 @@ function showFirmware() {
       " Then click \u201cOpen .fwsc\u2026\u201d (or drop the file on the synth); this browser keeps it for next time.";
     parts = [b, " · M-VAVE's own firmware. This page does not host it and cannot fetch it: ", dl, "." + have +
       (DEVICE === "fm1" ? " It starts with a small patch bank of the emulator's own; \u201cDX7 bank\u2026\u201d loads a 32-voice .syx · " :
-        " (Not playable yet: it boots, but its screen stays dark.) · "), doc];
+        " (A MIDI controller: its notes go to USB / Bluetooth MIDI, so no sound here; slower than real time in the browser so far.) · "), doc];
   } else {
     const a = document.createElement("a");
     a.href = fw.repo;

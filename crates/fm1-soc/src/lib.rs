@@ -42,7 +42,9 @@ pub const XIP_BASE: u32 = 0x0200_0000;
 pub const RAM_BASE: u32 = 0x01c0_0000;
 pub const OVL_BASE: u32 = 0x0400_0000;
 pub const SRAM2_BASE: u32 = 0x01f0_0000;
-/// The stock firmware's .bd_base: what the BT baseband's window register 0x2FC44 reads.
+/// The stock V13 firmware's .bd_base: what the BT baseband's window register 0x2FC44 reads
+/// before a firmware writes it (each stock image writes its own .bd_base there: V13 this,
+/// the SMK-37's v016 0x01C09A18).
 pub const BT_WINDOW_BASE: u32 = 0x01c0_9e7c;
 /// The flash offset behind XIP 0x02000000 (the stock layout: the app area starts at 0x4000).
 pub const XIP_FLASH_OFFSET: usize = 0x4000;
@@ -85,6 +87,26 @@ enum Region {
 }
 
 /// The SoC bus: XIP flash + data RAM + modeled peripherals + a logged stub.
+/// A cheap hasher for register addresses (the SoC's register map): `std`'s SipHash cost the
+/// SMK-37's stock firmware, which touches registers about a million times a second, a few
+/// percent of its time.
+#[derive(Default)]
+pub struct AddrHasher(u64);
+
+impl std::hash::Hasher for AddrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    fn write_u32(&mut self, v: u32) {
+        self.0 = (v as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
 /// The board around the chip: the FM-1's panel, or the SMK-37's (SMK-37 Pro / Elite, MKE-P37
 /// and Starrykey 37 Play share one: fm1-to-smk37 docs/01-hardware.md). Same chip, flash
 /// layout, audio and update path; the panel's wiring differs (smk.rs).
@@ -109,6 +131,8 @@ impl Board {
 
 pub struct Soc {
     pub board: Board,
+    /// The BT baseband's window base (0x2FC44), as the firmware set it.
+    bt_window: u32,
     pub xip: Vec<u8>,
     pub ram: Ram,
     pub lcd: Lcd,
@@ -124,7 +148,7 @@ pub struct Soc {
     pub ticks: u64,
     /// Timers, audio DMA, ADC, interrupt controller and the front panel.
     pub periph: Periph,
-    sfr: std::collections::HashMap<u32, u32>,
+    sfr: std::collections::HashMap<u32, u32, std::hash::BuildHasherDefault<AddrHasher>>,
     /// Core 0 / 1 paused by the other (C0_CON / C1_CON bit 2 pulses, bit 3 resumes).
     paused: [bool; 2],
     /// The XIP window continues into the flash chip past the image (the stock layout, which
@@ -178,6 +202,7 @@ impl Soc {
     pub fn new(ram_size: usize, xip: Vec<u8>) -> Self {
         Self {
             board: Board::Fm1,
+            bt_window: BT_WINDOW_BASE,
             xip,
             ram: Ram::new(ram_size),
             ovl: Ram::new(512 * 1024),
@@ -187,7 +212,7 @@ impl Soc {
             console: Vec::new(),
             ticks: 0,
             periph: Periph::default(),
-            sfr: std::collections::HashMap::new(),
+            sfr: Default::default(),
             paused: [false; 2],
             lock_owner: None,
             crc: 0,
@@ -288,9 +313,10 @@ impl Soc {
             0x11d00..=0x11d1f => Region::Spi1,
             0x11e00..=0x11e1f => Region::Spi2,
             0x11800..=0x1183f => Region::Usb,
-            // the second USB PHY's pads as GPIO (the SMK-37's LED commons at 0x16A0C; the FM-1's
-            // stock firmware touches the block too, as before: unknown)
-            0x16a00..=0x16a1f if self.board == Board::Smk37 => Region::Usb,
+            // the second USB PHY (the SMK-37's LED commons at 0x16A0C, its pads used as GPIO; its
+            // stock firmware powers the PHY up at boot and waits for 0x16800 bit 4). The FM-1's
+            // stock firmware touches the block too, as before: unknown.
+            0x16800..=0x16a1f if self.board == Board::Smk37 => Region::Usb,
             0x12100..=0x1212f => Region::Uart1,
             0x13100..=0x1311f => Region::Adc,
             0x13500..=0x1350f => Region::Crc,
@@ -328,7 +354,7 @@ impl Soc {
                     self.lcd.feed(value as u8, dc);
                 }
                 self.sfr_set(addr, value);
-                self.spi1_done();
+                self.spi1_done(1);
             }
             0x11d0c => self.sfr_set(addr, value), // ADR
             0x11d10 => {
@@ -346,7 +372,7 @@ impl Soc {
                     None => self.periph.smk.pad_frame(&bytes),
                 }
                 self.sfr_set(addr, 0);
-                self.spi1_done();
+                self.spi1_done(n);
             }
             _ => self.sfr_set(addr, value),
         }
@@ -398,8 +424,13 @@ impl Soc {
 
     /// A SPI1 transfer finished (instantly here): with CON bit 13 (interrupt enable) that is
     /// IRQ 16, the stock LCD driver's DMA-done (its layer flush waits for the handler).
-    fn spi1_done(&mut self) {
-        if self.sfr_get(0x11d00) & 0x2000 != 0 {
+    /// (SMK-37: it takes the bytes' time on the wire, see `Periph::spi1_start`.)
+    fn spi1_done(&mut self, bytes: u32) {
+        let irq = self.sfr_get(0x11d00) & 0x2000 != 0;
+        if self.board == Board::Smk37 {
+            let baud = self.sfr_get(0x11d04);
+            self.periph.spi1_start(bytes, baud, irq);
+        } else if irq {
             self.periph.spi1_pending = true;
         }
     }
@@ -574,6 +605,8 @@ impl Soc {
                     _ => v,
                 }
             }
+            // (the second USB PHY ready: bit 4 of its control word, once it is powered up)
+            Region::Usb if addr == 0x16800 => self.sfr_get(addr) | 0x10,
             Region::Iomap | Region::Usb | Region::Clk => self.sfr_get(addr),
             // JL_ANA (analog: WLA, DAC trim). 0x11978 is the DAC trim measurement after the
             // strobe at the same word: bit 5 = conversion done, bits 8-15 = the value (mid
@@ -586,13 +619,13 @@ impl Soc {
             }
             // the Bluetooth baseband (bsfr 0x20000; no radio here): reads 0, writes are
             // dropped (self-clearing requests like bt_clkn_compare_arm's capture at 0x2001C
-            // must read done), except 0x2FC44, the read-only base of the RAM window its
-            // buffers live in (never written: fixed in hardware). The stock BT stack checks
-            // buffers against it: descriptors within 2 KiB and below its own .bd_base + 1088
-            // (the constant it loads next to the read), bulk buffers within 32 KiB. .bd_base
-            // opens the BT bss (SDK btctler_lib_bss.ld): 0x01C09E7C in the stock V13 image.
+            // must read done), except 0x2FC44, the base of the RAM window its buffers live in,
+            // which the BT init writes (its .bd_base, which opens the BT bss, SDK
+            // btctler_lib_bss.ld). The stock BT stack checks buffers against it: descriptors
+            // within 2 KiB and below its own .bd_base + 1088, bulk buffers within 32 KiB; with
+            // V13's base kept, the SMK-37 firmware's check failed and it reset.
             Region::Bt => {
-                if addr == 0x2fc44 { BT_WINDOW_BASE } else { 0 }
+                if addr == 0x2fc44 { self.bt_window } else { 0 }
             }
             Region::Gpio | Region::Adc | Region::Alnk | Region::Irqc2 | Region::Uart1 => {
                 match self.periph.read(addr) {
@@ -611,8 +644,10 @@ impl Soc {
             Region::Spi2 => self.sfr_get(addr) | if addr == 0x11e00 { 0x8000 } else { 0 },
             Region::Spi1 => {
                 if addr == 0x11d00 {
-                    // CON: always report transfer-done so polls finish
-                    self.sfr_get(addr) | 0x8000
+                    // CON: transfer-done (the FM-1: always, so polls finish; the SMK-37: once the
+                    // bytes have gone out)
+                    let busy = self.board == Board::Smk37 && self.periph.cycles < self.periph.spi1_done_at;
+                    self.sfr_get(addr) | if busy { 0 } else { 0x8000 }
                 } else if addr == 0x11d10 {
                     self.sfr_get(addr)
                 } else {
@@ -705,7 +740,11 @@ impl Soc {
             }
             Region::Iomap => self.sfr_set(addr, value),
             Region::Ana => self.sfr_set(addr, value),
-            Region::Bt => {}
+            Region::Bt => {
+                if addr == 0x2fc44 {
+                    self.bt_window = value;
+                }
+            }
             Region::Clk => {
                 if addr == 0x10008 && value & 8 != 0 && self.sfr_get(addr) & 8 == 0 {
                     self.cpu1_release = true;

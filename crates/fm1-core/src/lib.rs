@@ -1050,7 +1050,8 @@ impl Cpu {
                 };
             }
             Fast::FOp { d, a, b, op } => {
-                self.regs[(d & 15) as usize] = fpu(op, self.regs[(a & 15) as usize], self.regs[(b & 15) as usize])
+                let d = (d & 15) as usize;
+                self.regs[d] = fpu_d(op, self.regs[d], self.regs[(a & 15) as usize], self.regs[(b & 15) as usize])
             }
             Fast::MemA4 { b, off, op, rk, rv } => {
                 let rhs = match rk { 0 => self.regs[(rv & 15) as usize], 1 => rv, _ => 1u32 << (self.regs[(rv & 15) as usize] & 31) };
@@ -1204,7 +1205,10 @@ impl Cpu {
                     1 => x.wrapping_neg(),
                     2 => (x as i32).wrapping_abs() as u32,
                     3 => x.swap_bytes(),
-                    _ => x.leading_zeros(),
+                    4 => x.leading_zeros(),
+                    // sat16 (s) / (u): a signed value into -32768..32767 / 0..65535
+                    5 => (x as i32).clamp(-32768, 32767) as u32,
+                    _ => (x as i32).clamp(0, 65535) as u32,
                 };
             }
             Fast::Div { d, a, b, k } => {
@@ -1267,6 +1271,45 @@ impl Cpu {
         let v = |cpu: &Self, i: usize| -> Result<u32, CoreError> { Ok(cpu.slot(insn, i)? as u32) };
         let r = |cpu: &Self, i: usize| -> Result<usize, CoreError> { cpu.reg(insn, i) };
         let mut jump: Option<u32> = None;
+
+        // ---- special registers to / from the stack (ISR wrappers, prologues, context
+        // switches): first, as interrupt-heavy firmware runs them constantly (the SMK-37's
+        // stock firmware: ~150 k interrupts a second). Push in printed order (first item at the
+        // highest address), pop ascending assigning the printed list reversed.
+        fn named_list(list: &'static str) -> Option<([&'static str; 10], usize)> {
+            let inner = list.strip_prefix('{')?.strip_suffix('}')?;
+            let (mut a, mut n) = ([""; 10], 0);
+            for t in inner.split(", ") {
+                if n == 10 || !matches!(t, "psr" | "rets" | "reti" | "retx" | "rete" | "sr4" | "icfg" | "sp" | "ssp" | "usp") {
+                    return None;
+                }
+                a[n] = t;
+                n += 1;
+            }
+            Some((a, n))
+        }
+        if let Some((list, n)) = s.strip_prefix("[--sp] = ").and_then(named_list) {
+            if list[..n].contains(&"reti") {
+                self.nest_ok = true;
+            }
+            for name in &list[..n] {
+                let val = sreg_get_named(self, name);
+                self.sp = self.sp.wrapping_sub(4);
+                bus.write32(self.sp, val);
+            }
+            return Ok(Some(None));
+        }
+        if let Some((list, n)) = s.strip_suffix(" = [sp++]").and_then(named_list) {
+            if list[..n].contains(&"reti") {
+                self.nest_ok = false;
+            }
+            for name in list[..n].iter().rev() {
+                let val = bus.read32(self.sp);
+                self.sp = self.sp.wrapping_add(4);
+                self.set_sreg_named(name, val);
+            }
+            return Ok(Some(None));
+        }
 
         // ---- branches: if[s] (<cond>) goto #i --------------------------
         if (s.starts_with("if (") || s.starts_with("ifs (")) && s.ends_with(") goto #i") {
@@ -1555,38 +1598,6 @@ impl Cpu {
         // prologues, context switches): same convention as the register
         // blocks — push in printed order (first item at the highest
         // address), pop ascending assigning the printed list reversed.
-        fn named_list(list: &str) -> Option<Vec<String>> {
-            let inner = list.strip_prefix('{')?.strip_suffix('}')?;
-            let items: Vec<&str> = inner.split(", ").collect();
-            if items.iter().all(|t| matches!(*t, "psr" | "rets" | "reti" | "retx" | "rete" | "sr4" | "icfg" | "sp" | "ssp" | "usp")) {
-                Some(items.into_iter().map(String::from).collect())
-            } else {
-                None
-            }
-        }
-        if let Some(list) = s.strip_prefix("[--sp] = ").and_then(named_list) {
-            if list.iter().any(|n| n == "reti") {
-                self.nest_ok = true;
-            }
-            for n in &list {
-                let val = sreg_get_named(self, n);
-                self.sp = self.sp.wrapping_sub(4);
-                bus.write32(self.sp, val);
-            }
-            return Ok(Some(None));
-        }
-        if let Some(list) = s.strip_suffix(" = [sp++]").and_then(named_list) {
-            if list.iter().any(|n| n == "reti") {
-                self.nest_ok = false;
-            }
-            for n in list.iter().rev() {
-                let val = bus.read32(self.sp);
-                self.sp = self.sp.wrapping_add(4);
-                self.set_sreg_named(n, val);
-            }
-            return Ok(Some(None));
-        }
-
         // ---- table branches, plain block push/pop, cache ops ----------------
         match s {
             "tbb [R]" | "tbh [R]" => {
@@ -2437,7 +2448,7 @@ impl Cpu {
 
             ROUTE_FPU => {
                 let (op, d, a, b) = decode_fpu(insn.raw);
-                self.regs[d as usize] = fpu(op, self.regs[a as usize], self.regs[b as usize]);
+                self.regs[d as usize] = fpu_d(op, self.regs[d as usize], self.regs[a as usize], self.regs[b as usize]);
             }
             ROUTE_SYNTAX => match self.exec_syntax(bus, insn, next_pc) {
                 Ok(Some(j)) => jumped = j,
@@ -2563,6 +2574,33 @@ impl Cpu {
                     };
                 }
                 self.regs[b] = addr.wrapping_add(inc as u32);
+            }
+            35 =>
+            {
+                // `5x ed` (see `half_mem`); a pre-increment updates the base first
+                let m = half_mem(raw).unwrap();
+                let a = self.regs[m.b].wrapping_add(m.off as u32);
+                if m.pre {
+                    self.regs[m.b] = a;
+                }
+                if m.store {
+                    let v = self.regs[m.d] >> if m.flag { 16 } else { 0 };
+                    bus.write16(a, v as u16);
+                } else {
+                    let v = bus.read16(a);
+                    self.regs[m.d] = if m.flag { v as i16 as i32 as u32 } else { v as u32 };
+                }
+            }
+            36 =>
+            {
+                let (d, s) = (((raw >> 28) & 0xf) as usize, ((raw >> 24) & 0xf) as usize);
+                self.regs[d] = self.regs[s].leading_zeros();
+            }
+            34 =>
+            {
+                let (d, s, signed) = sat16_raw(raw).unwrap();
+                let x = self.regs[s as usize] as i32;
+                self.regs[d as usize] = if signed { x.clamp(-32768, 32767) } else { x.clamp(0, 65535) } as u32;
             }
             33 =>
             {
@@ -2760,6 +2798,20 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
         // word offset), s = store (route 33; all 20620 corpus samples fit): the classes fit only
         // the corpus offsets (ObervaVe's `r3 = [sp+2384]`)
         Err(_) if win & 0xffff == 0xe9d4 => raw(&SP_WORD_CRAW),
+        // `5x ed`: halfword loads / stores at a 10-bit offset, plain or pre-incrementing the base
+        // (route 35, `half_mem`; all 30337 corpus samples fit): the classes fit only the corpus
+        // offsets (JIANT's `h[++r5=-198] = r0`)
+        Err(_) if half_mem(win & 0xffff_ffff).is_some() => raw(&HALF_MEM_CRAW),
+        // `80 e1 00 DS` / `80 f1 00 DS` (a dual-issue pair's head): rD = clz(rS). The classes fit
+        // only the corpus registers and had no `f1` form (Bubba Machine's)
+        Err(_) if win & 0xff_ffff == 0x00_e180 => raw(&CLZ_CRAW),
+        Err(_) if win & 0xff_ffff == 0x00_f180 => raw(&CLZ_PAIR_CRAW),
+        // `3f e5 Ax DB` (and `3f f5`, a dual-issue pair's head) with op 7 / 8: the float
+        // multiply-accumulates `rD += rA * rB (f)` / `rD -= rA * rB (f)` (vendor assembler,
+        // work/probe/fpu78b.S); the corpora's FPU classes had none (the SMK-37's stock DSP code)
+        Err(_) if matches!(win & 0xffff, 0xe53f | 0xf53f) && matches!((win >> 16) & 0xf, 7 | 8) => {
+            raw(if win & 0xffff == 0xf53f { &FPU_MAC_PAIR_CRAW } else { &FPU_MAC_CRAW })
+        }
         // 4-byte ALU forms decode_alu4 knows the layout of (`6c e8` `[R+#i] <<= #n`, `64 e8`
         // `[R+#i] &= R`, ...): the table's classes fit only the offsets the corpora used
         // (m6502's `[r0+24] <<= 1`, `[r1+-4] &= r0`)
@@ -2929,6 +2981,26 @@ static RETS_PUSH_MASK_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
 static PC_POP_MASK_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "pc_mask_mov_sp_craw", syntax: "{pc, R*4} = [sp++]", len: 4, count: 0, mask: 0, match_: 0,
     group: "stack", alt: &[], samples: &[], slots: &[],
+};
+static FPU_MAC_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "fpu_mac_craw", syntax: "R += R * R (f)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static FPU_MAC_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "fpu_mac_craw", syntax: "R += R * R (f) #", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static HALF_MEM_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "half_mem_craw", syntax: "h[R+#i] (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "load", alt: &[], samples: &[], slots: &[],
+};
+static CLZ_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "clz_pair_craw", syntax: "R = clz(R) (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static CLZ_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "clz_pair_craw", syntax: "R = clz(R)  #", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
 };
 static SP_WORD_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "sp_word_craw", syntax: "R = [sp+#i] (raw)", len: 4, count: 0, mask: 0, match_: 0,
@@ -4061,6 +4133,7 @@ impl Fast {
             Fast::Mov { d, s } | Fast::Ext { d, s, .. } | Fast::BitExt { d, s, .. } | Fast::Un { d, s, .. }
             | Fast::ShlI { d, s, .. } | Fast::SarI { d, s, .. } | Fast::AddRI { d, s, .. } => (m(s), m(d)),
             Fast::MovI { d, .. } | Fast::RFromSp { d, .. } | Fast::IcfgRd { d } => (0, m(d)),
+            Fast::FOp { d, a, b, op: 7 | 8 } => (m(a) | m(b) | m(d), m(d)),
             Fast::Alu3 { d, a, b, .. } | Fast::FOp { d, a, b, .. } | Fast::MinMax { d, a, b, .. } | Fast::Div { d, a, b, .. } => (m(a) | m(b), m(d)),
             Fast::Alu3I { d, a, .. } => (m(a), m(d)),
             Fast::Alu2 { d, b, .. } => (m(d) | m(b), m(d)),
@@ -4152,6 +4225,8 @@ fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) 
             // `[++R=R]` / `[R++=R]`, the table's classes too (one executed `h[r9++=r0] = r0.h`
             // as an immediate increment); before route 19, whose `++=` test would take it so
             _ if insn.entry.len == 4 && idx_inc(insn.raw).is_some() => 32,
+            // `78..7b e0 0S DS`: rD = sat16(rS) (u / s) (the table's class fits few registers)
+            _ if insn.entry.len == 4 && sat16_raw(insn.raw).is_some() => 34,
             _ if bittest.is_some() => 0,
             _ if alu4.is_some() => 1,
             "nop" | "csync" | "sti_r" | "cli_r" => 2,
@@ -4206,6 +4281,8 @@ fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) 
             "pc_r_1_mov_sp" | "pc_r_2_mov_sp" | "pc_r_3_mov_sp"
             | "pc_r_4_mov_sp" | "pc_r_mov_sp" | "pc_mask_mov_sp_craw" => 28,
             "sp_word_craw" => 33,
+            "half_mem_craw" => 35,
+            "clz_pair_craw" => 36,
             "rep_i_r" | "rep_i_i" => 29,
             n if n.starts_with("fpu_") => ROUTE_FPU,
             _ => ROUTE_SYNTAX,
@@ -4461,6 +4538,23 @@ fn fast_raw(route: u16, insn: &Instruction, alu4: &Option<Alu4>, bittest: &Optio
         16 | 18 | 19 | 21 | 22 | 27 | 32 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
         26 if insn.entry.len == 4 => Some(Fast::PushMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         28 if insn.entry.len == 4 => Some(Fast::PopMask { mask: ((raw >> 16) & 0xffff) as u16 }),
+        35 => {
+            let m = half_mem(raw)?;
+            let (d, b) = (m.d as u8, m.b as u8);
+            match (m.store, m.pre) {
+                (false, false) => Some(Fast::Ld { d, b: Base::Reg(b), off: m.off as u32, w: 2, signed: m.flag }),
+                (false, true) => Some(Fast::LdPre { d, b, i: 16, w: 2, signed: m.flag, inc: m.off as u32 }),
+                // (the store of the high half has no micro-op: route 35's step arm)
+                (true, _) if m.flag => None,
+                (true, false) => Some(Fast::St { s: d, b: Base::Reg(b), off: m.off as u32, w: 2 }),
+                (true, true) => Some(Fast::StPre { s: d, b, i: 16, w: 2, inc: m.off as u32 }),
+            }
+        }
+        36 => Some(Fast::Un { d: ((raw >> 28) & 0xf) as u8, s: ((raw >> 24) & 0xf) as u8, k: 4 }),
+        34 => {
+            let (d, s, signed) = sat16_raw(raw)?;
+            Some(Fast::Un { d, s, k: if signed { 5 } else { 6 } })
+        }
         33 => {
             let (r, off) = (((raw >> 28) & 0xf) as u8, ((raw >> 16) & 0xffe) as u32);
             Some(if raw & 0x1_0000 != 0 { Fast::StWSp { s: r, off } } else { Fast::LdWSp { d: r, off } })
@@ -4629,6 +4723,48 @@ fn fpu(op: u8, a: u32, b: u32) -> u32 {
         0x5f => x as u32,
         0x8f => (a as i32 as f32).to_bits(),
         _ => (a as f32).to_bits(),
+    }
+}
+
+/// `5x ed` halfword accesses: data = bits(28,31), base = bits(20,23), bit16 store, byte 0 bit 2
+/// signed (a load) / the high half (a store), bit 3 pre-increment; off = sext10(byte0 & 3 << 8 |
+/// bits(24,27) << 4 | bits(17,19) << 1), in bytes. All 30337 corpus samples fit.
+#[derive(Clone, Copy, Debug)]
+struct HalfMem { d: usize, b: usize, store: bool, flag: bool, pre: bool, off: i32 }
+fn half_mem(raw: u64) -> Option<HalfMem> {
+    if (raw >> 8) & 0xff != 0xed || raw & 0xf0 != 0x50 {
+        return None;
+    }
+    let (b0, b2, b3) = (raw & 0xff, (raw >> 16) & 0xff, (raw >> 24) & 0xff);
+    let x = ((b0 & 3) << 8 | (b3 & 15) << 4 | (b2 & 14)) as i32;
+    Some(HalfMem {
+        d: (b3 >> 4) as usize,
+        b: (b2 >> 4) as usize,
+        store: b2 & 1 != 0,
+        flag: b0 & 4 != 0,
+        pre: b0 & 8 != 0,
+        off: if x & 512 != 0 { x - 1024 } else { x },
+    })
+}
+
+/// `78..7b e0 0S DS`: rD = sat16(rS), S 1 signed (s), 0 unsigned (u); byte 0's low bits do not
+/// change it (all 22 corpus samples). (d, s, signed).
+fn sat16_raw(raw: u64) -> Option<(u8, u8, bool)> {
+    if (raw >> 8) & 0xff != 0xe0 || raw & 0xfc != 0x78 || (raw >> 16) & 0xfe != 0 {
+        return None;
+    }
+    Some((((raw >> 28) & 0xf) as u8, ((raw >> 24) & 0xf) as u8, (raw >> 16) & 1 != 0))
+}
+
+/// `fpu` with the destination's old value: ops 7 and 8 are `d += a * b` / `d -= a * b` (the
+/// vendor assembler's `R += R * R (f)`, `R -= R * R (f)`). Not fused: JieLi's clang implements
+/// fmaf with a library call rather than with them, so the product is rounded before the add.
+fn fpu_d(op: u8, d: u32, a: u32, b: u32) -> u32 {
+    let (x, y, acc) = (f32::from_bits(a), f32::from_bits(b), f32::from_bits(d));
+    match op {
+        7 => (acc + x * y).to_bits(),
+        8 => (acc - x * y).to_bits(),
+        _ => fpu(op, a, b),
     }
 }
 

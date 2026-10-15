@@ -712,7 +712,8 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u3
                 g.a.bind(taken);
                 g.chain(next_pc, count);
             }
-            Fast::FOp { d, a, b, op } => {
+            // (the multiply-accumulates 7 / 8 read d too: through the interpreter's executor)
+            Fast::FOp { d, a, b, op } if !matches!(op, 7 | 8) => {
                 g.ld_reg(0, a);
                 match op {
                     0x1f | 0x5f => {

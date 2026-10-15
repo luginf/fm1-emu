@@ -1,0 +1,30 @@
+[package]
+name = "fm1-plugin"
+description = "The FM-1 emulator as an instrument plugin: CLAP from Rust, AU and VST3 through clap-wrapper"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+fm1-core = { path = "../fm1-core" }
+fm1-soc = { path = "../fm1-soc" }
+# no default features: they bring nih-plug's VST3 bindings (GPL); VST3 comes from clap-wrapper
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683", default-features = false }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683" }
+rtrb = "0.3"
+rfd = "0.15"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = "0.3"
+
+# Its own workspace: the GUI and plugin dependencies stay out of the emulator's builds and CI.
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = "thin"

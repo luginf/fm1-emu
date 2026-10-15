@@ -514,6 +514,72 @@ wasm).
 - fm1-live opens an SMK-37 package in an SMK-37 window (`window_smk`; not tried by hand yet);
   `Action::Vel` carries a key velocity.
 
+## 5.16 M-VAVE's own SMK-37 firmware runs (2026-10-15)
+
+It booted to a dark screen. Five things, in the order they showed up (all SMK-37-only or gaps no
+FM-1 firmware reaches; every FM-1 firmware byte-identical, native and wasm):
+
+- An interrupt storm, 2.4 M a second: its ADC scan chains conversions through IRQ 24, each handler
+  starting the next, and conversions finished at once. On the SMK-37 a conversion now takes 40 us
+  (the hardware map's SMK timing) and raises IRQ 24 at its end (`Periph::adc_next`).
+- Its Bluetooth controller task reset the chip ("btctrler"): its buffers are checked against the BT
+  window base at 0x2FC44, which the emulator served as V13's .bd_base. The firmware writes that
+  register (V13 writes 0x01C09E7C, the SMK-37's v016 0x01C09A18): it is stored now.
+- The float multiply-accumulates `3f e5` op 7 / 8: `rD += rA * rB (f)` / `rD -= ...` (vendor
+  assembler; not fused: JieLi's clang calls a library fmaf). Native JIT: through the helper.
+- `78..7b e0 0S DS`: rD = sat16(rS) (s / u), now a micro-op (the table's class had no semantics).
+- Core 0 waited at boot for the second USB PHY (0x16800 bit 4, after powering it up): the block
+  is stored registers on the SMK-37, bit 4 reading set.
+
+It runs as a MIDI controller: the main screen, buttons (ARP toggles the arpeggiator, its LED
+lights), pads lit, and the keys: PATCH, then C-E-G held, and it shows "C Maj" with those keys
+marked, which also confirms the matrix's column numbering independently of the ports. No sound:
+its notes go to USB / Bluetooth MIDI. SPI1 transfers take their time on the wire on the SMK-37
+(60 MHz / (BAUD + 1), done bit and IRQ 16 at the end).
+
+Speed: ~150 k interrupts a second (its key scan from SPI2's interrupt), and the ISR wrappers'
+`{psr, rets, reti}` pushes / pops went through `exec_syntax`'s string matching with an allocation
+each: now first in exec_syntax, allocation-free (native 1.17x -> 1.42x at 240 MHz); the SoC's
+register map hashes with a cheap multiplicative hash instead of SipHash. In the browser it runs at
+~0.6x real time whatever the clock: the cost is per interrupt and peripheral event. Next for it:
+the interrupt path (ISR entry / exit as micro-ops, fewer compiled-code exits).
+`fm1-emu` prints interrupts by source; `FM1_FWSC_XIP=file` saves a package's XIP window.
+
+## 5.17 The catalog follows the FM-1 Firmware Hub too (2026-10-15)
+
+thefirmwarehub.com (designburg's hub, `/catalog.json`, 37 firmwares) lists more than
+fm1-editor.com. Its own package copies (`fw/<name>.fwsc`) have no CORS header, so the page
+fetches each one from its author: github.io pages, or raw.githubusercontent.com for a repo's
+`docs/` (both send `Access-Control-Allow-Origin: *`). GitHub release assets don't, and the
+firmwares published only that way stay out (Dinghy, fm1-chord, MAKU, FM-106, Fart Machine One,
+Felucca 8 Patterns); DUELL and MYCELIUM have no published package.
+
+Added: CTL-1, ETCH, FM-1 Doom, JIANT FM, OberVave, Polly, Skiff, SLOOP DX7 Banks, SLOOP Floyd FM,
+sloopDX, TRIBE, winampFM, zp12 (35 entries, 33 community). Bumped: Felucca 1.6.1, Jangada 1.0,
+Melodee 1.3.6, X0X 1.0.9. Two decoder gaps: `5x ed` halfword loads / stores (route 35, the
+classes fit only the corpus offsets; JIANT) and `80 e1|f1 00 DS` clz (route 36; Bubba Machine).
+Not added yet: Bubba Machine (stops on `rts` decoded as data at 0x0201d5d4, no audio) and Doom
+E1M1 (spins on a timer at 0x020035dc waiting for `[r10+4]` to advance, blue screen).
+
+## 5.18 The plugin: AU, VST3 and CLAP (2026-10-15)
+
+`crates/fm1-plugin` (its own cargo workspace, so its GUI dependencies stay out of the emulator's
+builds): one CLAP instrument written with nih-plug, its VST3 feature off since that brings GPL
+bindings. clap-wrapper v0.16 (`crates/fm1-plugin/wrap`, CMake + Ninja) makes the AUv2 and the VST3
+of it, with Apple's AudioUnitSDK (Apache-2.0) and the VST3 SDK 3.8 (MIT); each bundle carries the
+CLAP in Contents/PlugIns, where the wrapper looks first. `tools/build_plugin.sh` builds, signs ad
+hoc, installs, runs `auval` (passes: render tests at 11.025-192 kHz, latency, state, UI).
+Under Ninja clap-wrapper's PRE_BUILD copy of the generated Info.plist is overwritten by the
+bundle's default one (no AudioComponents: "didn't find the component"); the script copies it in.
+
+The machine runs on its own thread, a ring of 44.1 kHz frames ahead of the host (a host block +
+1024), host MIDI stamped with its frame (the host's position + the lead), applied when the machine
+reaches it; the lead is the latency reported. A test (`tests/engine.rs`) runs Felucca and finds a
+stamped note sounding 312 frames after its frame (the DMA half then running, and the attack).
+The project keeps the package (base64) and the flash sectors the firmware wrote (checked every
+2 s), so patches come back. The window draws panel.rs / panel_smk.rs, played as on the page;
+MASTER is a host parameter, so is a MIDI channel override (M-VAVE's firmware listens on 2).
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

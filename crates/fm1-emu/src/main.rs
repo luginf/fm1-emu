@@ -200,6 +200,11 @@ fn main() -> ExitCode {
         };
         match std::fs::read(path).map_err(|e| e.to_string()).and_then(|p| fm1_soc::stock_from_package(&p, syx.as_deref())) {
             Ok(st) => {
+                // FM1_FWSC_XIP=file: save the XIP window (the app area unscrambled) for a disassembler
+                if let Ok(out) = std::env::var("FM1_FWSC_XIP") {
+                    let _ = std::fs::write(&out, &st.xip);
+                    println!("XIP window ({} bytes from 0x02000000, {}) -> {out}", st.xip.len(), st.identity);
+                }
                 if std::env::var_os("FM1_FWSC_DIR").is_some() {
                     if let Ok(u) = std::fs::read(path).map_err(|e| e.to_string()).and_then(|p| fm1_soc::fwsc::unpack(&p)) {
                         println!("app area at {:#x}, {} bytes visible through XIP", u.area, u.xip.len());
@@ -301,6 +306,8 @@ fn main() -> ExitCode {
     let mut snaps: Vec<u64> = args.snap.clone();
     snaps.sort_unstable();
     let mut irq_count: u64 = 0;
+    // interrupts taken per source and core (the summary's busiest)
+    let mut irq_by: std::collections::BTreeMap<(u32, u8), u64> = Default::default();
     // cpu0 instructions outside any ISR, in one ISR level, in a nested level
     let mut busy = [0u64; 3];
     let irq_trace = std::env::var("FM1_IRQ_TRACE").is_ok();
@@ -462,6 +469,7 @@ fn main() -> ExitCode {
                     }
                     cpu.interrupt(handler, prio);
                     irq_count += 1;
+                    *irq_by.entry((cpu.core_id, n as u8)).or_default() += 1;
                 }
             }
             if ci == 0 {
@@ -563,6 +571,10 @@ fn main() -> ExitCode {
                 soc.periph.audio_halves,
                 soc.periph.audio.len() / 2
             );
+            let mut by: Vec<_> = irq_by.iter().collect();
+            by.sort_by(|a, b| b.1.cmp(a.1));
+            let by: Vec<String> = by.iter().take(8).map(|((c, n), k)| format!("c{c} irq {n} x{k}")).collect();
+            println!("interrupts by source: {}", by.join(", "));
             if let Some(w) = &args.wav {
                 match write_wav(w, &soc.periph.audio) {
                     Ok(()) => println!("wav: {w} ({:.2} s)", soc.periph.audio.len() as f64 / 2.0 / 44100.0),
