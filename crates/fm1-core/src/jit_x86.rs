@@ -837,6 +837,108 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u8
                 g.a.ld(W0, RSP, KEEP);
                 g.exit_reg(W0, count);
             }
+            Fast::SpAdd { v } => {
+                g.a.ld(W0, CPU, off_sp());
+                g.add_w0(v);
+                g.a.st(CPU, off_sp(), W0);
+            }
+            Fast::SpFromR { s } => {
+                g.ld_reg(W0, s);
+                g.a.st(CPU, off_sp(), W0);
+            }
+            Fast::RFromSp { d, v } => {
+                g.a.ld(W0, CPU, off_sp());
+                g.add_w0(v);
+                g.st_reg(W0, d);
+            }
+            Fast::Mov2 { dh, dl, sh, sl } => {
+                g.ld_reg(W0, sh);
+                g.ld_reg(W1, sl);
+                g.st_reg(W0, dh);
+                g.st_reg(W1, dl);
+            }
+            Fast::Mov2I { dh, dl, v } => {
+                g.a.mov_i(W0, v);
+                g.st_reg(W0, dl);
+                g.a.mov_i(W0, ((v as i32) >> 31) as u32);
+                g.st_reg(W0, dh);
+            }
+            Fast::BitExt { d, s, p, l, signed } => {
+                let (p, l) = (p as u32 & 31, l as u32 & 31);
+                g.ld_reg(W0, s);
+                if p != 0 {
+                    g.a.shift_i(Sh::Shr, W0, p as u8); // (a logical shift first, as the interpreter)
+                }
+                if signed {
+                    if l != 0 {
+                        g.a.shift_i(Sh::Shl, W0, (32 - l) as u8);
+                        g.a.shift_i(Sh::Sar, W0, (32 - l) as u8);
+                    }
+                } else if l != 0 {
+                    g.a.alu_i(Alu::And, W0, ((1u32 << l) - 1) as i32);
+                }
+                g.st_reg(W0, d);
+            }
+            Fast::BitIns { d, s, p, l } => {
+                let (p, l) = (p as u32 & 31, l as u32 & 31);
+                let mask = if l == 0 { 0xffff_ffffu32 } else { (1u32 << l) - 1 };
+                g.ld_reg(W0, s);
+                if l != 0 {
+                    g.a.alu_i(Alu::And, W0, mask as i32);
+                }
+                if p != 0 {
+                    g.a.shift_i(Sh::Shl, W0, p as u8);
+                }
+                g.ld_reg(W1, d);
+                g.a.alu_i(Alu::And, W1, !(mask << p) as i32);
+                g.a.alu(Alu::Or, W1, W0);
+                g.st_reg(W1, d);
+            }
+            Fast::PopRets => {
+                g.a.ld(W0, CPU, off_sp());
+                g.load(4, false, idx);
+                g.a.st(CPU, off_rets(), W0);
+                g.a.ld(W0, CPU, off_sp());
+                g.add_w0(4);
+                g.a.st(CPU, off_sp(), W0);
+                bus_used = true;
+            }
+            Fast::PushRets { n } => {
+                let n = n as i32;
+                let (top, bot) = (n.max(3), n.min(4));
+                for r in std::iter::once(-1i32).chain((bot..=top).rev()) {
+                    g.a.ld(W0, CPU, off_sp());
+                    g.a.alu_i(Alu::Sub, W0, 4);
+                    g.a.st(CPU, off_sp(), W0);
+                    if r < 0 {
+                        g.a.ld(W1, CPU, off_rets());
+                    } else {
+                        g.ld_reg(W1, (r & 15) as u8);
+                    }
+                    g.store(4, idx);
+                }
+                bus_used = true;
+            }
+            Fast::PopPc { n } => {
+                let n = n as i32;
+                let (top, bot) = (n.max(3), n.min(4));
+                for r in bot..=top {
+                    g.a.ld(W0, CPU, off_sp());
+                    g.load(4, false, idx);
+                    g.st_reg(W0, (r & 15) as u8);
+                    g.a.ld(W0, CPU, off_sp());
+                    g.add_w0(4);
+                    g.a.st(CPU, off_sp(), W0);
+                }
+                g.a.ld(W0, CPU, off_sp());
+                g.load(4, false, idx);
+                g.a.st(RSP, KEEP, W0);
+                g.a.ld(W0, CPU, off_sp());
+                g.add_w0(4);
+                g.a.st(CPU, off_sp(), W0);
+                g.a.ld(W0, RSP, KEEP);
+                g.exit_reg(W0, count);
+            }
             // ---- everything else: the interpreter's executor for this one op
             other => {
                 let p: &'static Fast = Box::leak(Box::new(other));
