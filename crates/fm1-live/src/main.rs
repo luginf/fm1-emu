@@ -70,13 +70,15 @@ struct Opts {
     audio_ms: f64,
     /// where the MIDI learn bindings are kept (--midi-map)
     midi_map: Option<String>,
+    /// forget the saved MIDI learn bindings at start (--midi-reset)
+    midi_reset: bool,
 }
 
 fn parse() -> Option<Opts> {
     let a: Vec<String> = std::env::args().collect();
     let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
                        name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0, fps: 60,
-                       fw_dir: "reference/firmwares".into(), azerty: false, midi_map: None, audio_ms: AUDIO_TARGET_MS };
+                       fw_dir: "reference/firmwares".into(), azerty: false, midi_map: None, midi_reset: false, audio_ms: AUDIO_TARGET_MS };
     // (before the rest, whatever the order: the directory the firmwares are in)
     if let Some(p) = a.iter().position(|x| x == "--fw-dir") {
         o.fw_dir = a.get(p + 1)?.clone();
@@ -140,6 +142,11 @@ fn parse() -> Option<Opts> {
                 }
             }
             "--audio-ms" => o.audio_ms = a.get(i + 1)?.parse().ok().filter(|m| (5.0..=250.0).contains(m))?,
+            "--midi-reset" => {
+                o.midi_reset = true;
+                i += 1;
+                continue;
+            }
             "--midi-map" => o.midi_map = Some(a.get(i + 1)?.clone()),
             "--fps" => o.fps = a.get(i + 1)?.parse().ok().filter(|f| (1..=240).contains(f))?,
             "--bench" => o.bench = Some(a.get(i + 1)?.parse().ok()?),
@@ -725,7 +732,7 @@ const DRAG_PER_CLICK: f32 = 12.0;
 
 fn main() {
     let Some(o) = parse() else {
-        eprintln!("usage: fm1-live [--fetch [ID ...]] [--fw ID | --fw list | --bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--fps 60] [--fw-dir DIR] [--audio-ms 50] [--layout qwerty|azerty] [--midi-map FILE] [--bench MS] [--midi all|none|NAME] [--midi-ch N]");
+        eprintln!("usage: fm1-live [--fetch [ID ...]] [--fw ID | --fw list | --bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--fps 60] [--fw-dir DIR] [--audio-ms 50] [--layout qwerty|azerty] [--midi-map FILE] [--midi-reset] [--bench MS] [--midi all|none|NAME] [--midi-ch N]");
         std::process::exit(2);
     };
     if let Some(ms) = o.shot {
@@ -763,6 +770,9 @@ fn main() {
     let quit = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Action>();
     let learn = Arc::new(midilearn::Learn::load(o.midi_map.as_ref().map(std::path::PathBuf::from).or_else(midilearn::default_path)));
+    if o.midi_reset {
+        learn.clear_all();
+    }
     let _midi = midi_inputs(&o, &tx, &learn);
 
     let audio_ok = _stream.is_some();
@@ -875,7 +885,7 @@ fn main() {
     } else {
         eprintln!("keys: A W S E D F T G Y H U J K O L P ; ' = C4..F5, Z/X OCT, Space PLAY, R REC, 1..0 buttons, arrows and , . for SELECT/PRESETS/ALGORITHM; Esc quits");
     }
-    eprintln!("MIDI learn: right-click a control, then move or press the one on your MIDI device (Del forgets it); {} bound", learn.count());
+    eprintln!("MIDI learn: right-click a control, then move or press the one on your MIDI device (Del forgets it, Shift+Del all); {} bound", learn.count());
 
     while win.is_open() && !win.is_key_down(Key::Escape) {
         let turn = |i: usize, clicks: i32, enc_clicks: &mut [i32; 7], turning: &mut [u32; 8]| {
@@ -974,6 +984,11 @@ fn main() {
         if learn.armed().is_some() && (win.is_key_pressed(Key::Delete, KeyRepeat::No) || win.is_key_pressed(Key::Backspace, KeyRepeat::No)) {
             learn.forget_armed();
         }
+        // Shift + Delete: forget every binding
+        if (win.is_key_down(Key::LeftShift) || win.is_key_down(Key::RightShift)) && win.is_key_pressed(Key::Delete, KeyRepeat::No) {
+            let n = learn.clear_all();
+            eprintln!("MIDI learn: all {n} bindings forgotten");
+        }
 
         // ---- held keys and buttons: computer keyboard + mouse
         let mut want = [false; 41];
@@ -1027,10 +1042,10 @@ fn main() {
         }
         // MIDI learn: a thin frame on what is bound, a thick orange one on what is being learned
         for t in learn.bound_targets() {
-            midilearn::frame(&mut buf, t, 0xff40_c0ff, 2);
+            midilearn::frame(&mut buf, t, 0xff8f_949c, 2);
         }
         if let Some(t) = learn.armed() {
-            midilearn::frame(&mut buf, t, 0xffff_9020, 5);
+            midilearn::frame(&mut buf, t, 0xfff2_a33a, 5);
         }
         if win.update_with_buffer(&buf, W, H).is_err() {
             break;

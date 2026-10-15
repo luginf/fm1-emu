@@ -1,7 +1,8 @@
 //! MIDI learn: bind a control of another MIDI device (a knob, a button, a pad, a key) to a
 //! control of the emulated FM-1. Right-click a control in the window to arm it, then move or
 //! press the control of the device: the binding is made and saved. Right-click it again to
-//! cancel; press Delete or Backspace while it is armed to forget its binding.
+//! cancel; press Delete or Backspace while it is armed to forget its binding, Shift+Delete to
+//! forget them all (`--midi-reset` does it at start; `--midi-map FILE` keeps another set).
 //!
 //! What a bound control does (every MIDI channel is told apart):
 //!   a key or a button   note on / off, or a CC at 64 and over / under
@@ -144,6 +145,17 @@ impl Learn {
     pub fn bound_to(&self, t: Target) -> Option<String> {
         let g = self.inner.lock().unwrap();
         g.binds.iter().find(|b| b.target == t).map(|b| format!("{} {} ch {}", if b.kind == Kind::Cc { "CC" } else { "note" }, b.num, b.ch + 1))
+    }
+
+    /// Forget every binding (and the saved file's); how many there were.
+    pub fn clear_all(&self) -> usize {
+        let mut g = self.inner.lock().unwrap();
+        let n = g.binds.len();
+        g.binds.clear();
+        g.armed = None;
+        g.held.clear();
+        g.save();
+        n
     }
 
     /// Forget the binding of the armed control, and disarm it.
