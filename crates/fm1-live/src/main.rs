@@ -23,6 +23,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use fm1_core::{Bus, Cpu};
 use fm1_soc::{machine, Action, Soc, VEC_BASE};
+mod fetch;
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use panel::{Ctl, ENCS, H, W};
 
@@ -60,32 +61,25 @@ struct Opts {
     midi_ch: u8,
     /// window refresh rate (--fps)
     fps: usize,
-}
-
-/// The firmware catalog web/firmwares.json as (id, name, version, image path): each image is
-/// reference/firmwares/<id>.xip.bin (tools/fetch_firmwares.mjs). A small scan for the string
-/// fields, enough for this file; no JSON dependency.
-fn catalog() -> Vec<(String, String, String, String)> {
-    let Ok(text) = std::fs::read_to_string("web/firmwares.json") else { return Vec::new() };
-    let field = |obj: &str, key: &str| -> Option<String> {
-        let at = obj.find(&format!("\"{key}\": \""))? + key.len() + 5;
-        Some(obj[at..at + obj[at..].find('"')?].to_string())
-    };
-    text.split("{ \"id\"").skip(1).filter_map(|chunk| {
-        let obj = format!("{{ \"id\"{chunk}");
-        if obj.contains("\"byo\": true") {
-            return None; // M-VAVE's own, brought by the user: --fwsc FM-1.fwsc
-        }
-        let id = field(&obj, "id")?;
-        let path = format!("reference/firmwares/{id}.xip.bin");
-        Some((id, field(&obj, "name")?, field(&obj, "version")?, path))
-    }).collect()
+    /// where the downloaded firmwares are (--fw-dir)
+    fw_dir: String,
 }
 
 fn parse() -> Option<Opts> {
     let a: Vec<String> = std::env::args().collect();
     let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
-                       name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0, fps: 60 };
+                       name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0, fps: 60,
+                       fw_dir: "reference/firmwares".into() };
+    // (before the rest, whatever the order: the directory the firmwares are in)
+    if let Some(p) = a.iter().position(|x| x == "--fw-dir") {
+        o.fw_dir = a.get(p + 1)?.clone();
+    }
+    // `--fetch [ID ...]`: download the catalog's firmwares (all, or those listed) and leave
+    if let Some(p) = a.iter().position(|x| x == "--fetch") {
+        let ids: Vec<String> = a[p + 1..].iter().take_while(|x| !x.starts_with("--")).cloned().collect();
+        let failed = fetch::run(&ids, std::path::Path::new(&o.fw_dir));
+        std::process::exit(if failed == 0 { 0 } else { 1 });
+    }
     let mut i = 1;
     while i < a.len() {
         match a[i].as_str() {
@@ -94,19 +88,32 @@ fn parse() -> Option<Opts> {
                 o.name = o.bin.rsplit('/').next().unwrap_or("").trim_end_matches(".bin").trim_end_matches(".xip").to_string();
             }
             "--fw" => {
-                // a firmware from web/firmwares.json by id (`--fw list` lists them)
+                // a firmware from the catalog by id (`--fw list` lists them), downloaded into
+                // the firmware directory when it is not there yet
                 let want = a.get(i + 1)?;
-                let cat = catalog();
+                let cat = fetch::catalog();
+                let dir = std::path::Path::new(&o.fw_dir);
                 if want == "list" {
-                    for (id, name, ver, path) in &cat {
-                        let have = if std::path::Path::new(path).exists() { "" } else { "  (missing: node tools/fetch_firmwares.mjs)" };
-                        println!("{id:14} {name} {ver}{have}");
+                    for e in cat.iter().filter(|e| !e.byo) {
+                        let have = if dir.join(format!("{}.xip.bin", e.id)).exists() { "" } else { "  (not downloaded: --fetch)" };
+                        println!("{:14} {} {}{have}", e.id, e.name, e.version);
                     }
                     std::process::exit(0);
                 }
-                let (_, name, ver, path) = cat.into_iter().find(|f| &f.0 == want)?;
-                o.bin = path;
-                o.name = format!("{name} {ver}");
+                let e = cat.into_iter().find(|e| &e.id == want && !e.byo)?;
+                let path = dir.join(format!("{}.xip.bin", e.id));
+                if !path.exists() {
+                    eprintln!("{}: downloading into {}", e.id, dir.display());
+                    match fetch::fetch_into(&e, dir) {
+                        Ok(m) => eprintln!("{}: {m}", e.id),
+                        Err(m) => {
+                            eprintln!("{}: {m}", e.id);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                o.bin = path.to_string_lossy().into_owned();
+                o.name = format!("{} {}", e.name, e.version);
             }
             "--fwsc" => {
                 o.fwsc = Some(a.get(i + 1)?.clone());
@@ -117,6 +124,7 @@ fn parse() -> Option<Opts> {
             "--midi-ch" => o.midi_ch = a.get(i + 1)?.parse().ok().filter(|c| *c <= 16)?,
             "--entry" => o.entry = u32::from_str_radix(a.get(i + 1)?.trim_start_matches("0x"), 16).ok()?,
             "--mhz" => o.mhz = a.get(i + 1)?.parse().ok()?,
+            "--fw-dir" => o.fw_dir = a.get(i + 1)?.clone(),
             "--fps" => o.fps = a.get(i + 1)?.parse().ok().filter(|f| (1..=240).contains(f))?,
             "--bench" => o.bench = Some(a.get(i + 1)?.parse().ok()?),
             "--shot" => o.shot = Some(a.get(i + 1)?.parse().ok()?),
@@ -653,7 +661,7 @@ const DRAG_PER_CLICK: f32 = 12.0;
 
 fn main() {
     let Some(o) = parse() else {
-        eprintln!("usage: fm1-live [--fw ID | --fw list | --bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--fps 60] [--bench MS] [--midi all|none|NAME] [--midi-ch N]");
+        eprintln!("usage: fm1-live [--fetch [ID ...]] [--fw ID | --fw list | --bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--fps 60] [--fw-dir DIR] [--bench MS] [--midi all|none|NAME] [--midi-ch N]");
         std::process::exit(2);
     };
     if let Some(ms) = o.shot {

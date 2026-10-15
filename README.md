@@ -103,7 +103,7 @@ screen stays dark.
 
 ```sh
 cargo run --release -p fm1-live -- --fw list           # the firmwares
-node tools/fetch_firmwares.mjs                          # download them into reference/firmwares
+cargo run --release -p fm1-live -- --fetch               # download them into reference/firmwares (no Node needed)
 cargo run --release -p fm1-live -- --fw felucca         # a window with the synth, audio out
 cargo run --release -p fm1-live -- --fwsc FM-1.fwsc     # M-VAVE's own, from its package
 ```
