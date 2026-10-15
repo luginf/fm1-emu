@@ -41,7 +41,7 @@ const RAM_SIZE: usize = 1 << 20;
 const LEAD_MS: f64 = 60.0;
 /// Once the firmware streams audio, the emulator runs whenever less than
 /// this much sound is queued: the audio device sets the pace.
-const AUDIO_TARGET_MS: f64 = 50.0;
+const AUDIO_TARGET_MS: f64 = 50.0; // (the default of --audio-ms)
 
 struct Opts {
     bin: String,
@@ -66,6 +66,8 @@ struct Opts {
     fw_dir: String,
     /// the computer keyboard is AZERTY (--layout azerty)
     azerty: bool,
+    /// sound kept queued ahead, in ms (--audio-ms)
+    audio_ms: f64,
     /// where the MIDI learn bindings are kept (--midi-map)
     midi_map: Option<String>,
 }
@@ -74,7 +76,7 @@ fn parse() -> Option<Opts> {
     let a: Vec<String> = std::env::args().collect();
     let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
                        name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0, fps: 60,
-                       fw_dir: "reference/firmwares".into(), azerty: false, midi_map: None };
+                       fw_dir: "reference/firmwares".into(), azerty: false, midi_map: None, audio_ms: AUDIO_TARGET_MS };
     // (before the rest, whatever the order: the directory the firmwares are in)
     if let Some(p) = a.iter().position(|x| x == "--fw-dir") {
         o.fw_dir = a.get(p + 1)?.clone();
@@ -137,6 +139,7 @@ fn parse() -> Option<Opts> {
                     _ => return None,
                 }
             }
+            "--audio-ms" => o.audio_ms = a.get(i + 1)?.parse().ok().filter(|m| (5.0..=250.0).contains(m))?,
             "--midi-map" => o.midi_map = Some(a.get(i + 1)?.clone()),
             "--fps" => o.fps = a.get(i + 1)?.parse().ok().filter(|f| (1..=240).contains(f))?,
             "--bench" => o.bench = Some(a.get(i + 1)?.parse().ok()?),
@@ -378,7 +381,9 @@ struct AudioRing {
     underruns: AtomicU64,
 }
 
-fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
+/// The audio output. `ms`: how much sound the emulation keeps queued ahead (`--audio-ms`); the
+/// sound card's own buffer is asked to be a third of that, as small as the device allows.
+fn start_audio(ring: Arc<AudioRing>, ms: f64) -> Result<cpal::Stream, String> {
     let host = cpal::default_host();
     let dev = host.default_output_device().ok_or("no audio output device")?;
     let cfg = dev.default_output_config().map_err(|e| e.to_string())?;
@@ -388,41 +393,55 @@ fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
     let channels = cfg.channels() as usize;
     let rate = cfg.sample_rate().0 as f64;
     let step = 44_100.0 / rate; // source frames per output frame
-    let (mut pos, mut cur, mut next) = (0.0f64, (0.0f32, 0.0f32), (0.0f32, 0.0f32));
-    let stream = dev
-        .build_output_stream(
-            &cfg.config(),
-            move |out: &mut [f32], _| {
-                let mut q = ring.q.lock().unwrap();
-                let mut starved = false;
-                for frame in out.chunks_mut(channels) {
-                    pos += step;
-                    while pos >= 1.0 {
-                        pos -= 1.0;
-                        cur = next;
-                        next = match (q.pop_front(), q.pop_front()) {
-                            (Some(l), Some(r)) => (l as f32 / 32768.0, r as f32 / 32768.0),
-                            _ => {
-                                starved = true;
-                                (0.0, 0.0)
-                            }
-                        };
-                    }
-                    let f = pos as f32;
-                    let (l, r) = (cur.0 + (next.0 - cur.0) * f, cur.1 + (next.1 - cur.1) * f);
-                    for (c, s) in frame.iter_mut().enumerate() {
-                        *s = if c % 2 == 0 { l } else { r };
-                    }
+    // (a callback per attempt: the first, with the wanted device buffer, may be refused)
+    let make = || {
+        let ring = ring.clone();
+        let (mut pos, mut cur, mut next) = (0.0f64, (0.0f32, 0.0f32), (0.0f32, 0.0f32));
+        move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            let mut q = ring.q.lock().unwrap();
+            let mut starved = false;
+            for frame in out.chunks_mut(channels) {
+                pos += step;
+                while pos >= 1.0 {
+                    pos -= 1.0;
+                    cur = next;
+                    next = match (q.pop_front(), q.pop_front()) {
+                        (Some(l), Some(r)) => (l as f32 / 32768.0, r as f32 / 32768.0),
+                        _ => {
+                            starved = true;
+                            (0.0, 0.0)
+                        }
+                    };
                 }
-                if starved && ring.started.load(Ordering::Relaxed) {
-                    ring.underruns.fetch_add(1, Ordering::Relaxed);
+                let f = pos as f32;
+                let (l, r) = (cur.0 + (next.0 - cur.0) * f, cur.1 + (next.1 - cur.1) * f);
+                for (c, s) in frame.iter_mut().enumerate() {
+                    *s = if c % 2 == 0 { l } else { r };
                 }
-            },
-            |e| eprintln!("audio: {e}"),
-            None,
-        )
-        .map_err(|e| e.to_string())?;
+            }
+            if starved && ring.started.load(Ordering::Relaxed) {
+                ring.underruns.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    };
+    let mut config = cfg.config();
+    let wanted = (rate * ms / 1000.0 / 3.0) as u32;
+    let stream = match cfg.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            config.buffer_size = cpal::BufferSize::Fixed(wanted.clamp(*min.max(&1), *max));
+            dev.build_output_stream(&config, make(), |e| eprintln!("audio: {e}"), None).or_else(|e| {
+                eprintln!("audio: a {} frame device buffer was refused ({e}); the default one then", wanted);
+                config.buffer_size = cpal::BufferSize::Default;
+                dev.build_output_stream(&config, make(), |e| eprintln!("audio: {e}"), None)
+            })
+        }
+        cpal::SupportedBufferSize::Unknown => dev.build_output_stream(&config, make(), |e| eprintln!("audio: {e}"), None),
+    }
+    .map_err(|e| e.to_string())?;
     stream.play().map_err(|e| e.to_string())?;
+    if let cpal::BufferSize::Fixed(n) = config.buffer_size {
+        eprintln!("audio: {} Hz, device buffer {n} frames ({:.1} ms), {ms:.0} ms queued ahead", rate as u32, n as f64 * 1000.0 / rate);
+    }
     Ok(stream)
 }
 
@@ -706,7 +725,7 @@ const DRAG_PER_CLICK: f32 = 12.0;
 
 fn main() {
     let Some(o) = parse() else {
-        eprintln!("usage: fm1-live [--fetch [ID ...]] [--fw ID | --fw list | --bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--fps 60] [--fw-dir DIR] [--layout qwerty|azerty] [--midi-map FILE] [--bench MS] [--midi all|none|NAME] [--midi-ch N]");
+        eprintln!("usage: fm1-live [--fetch [ID ...]] [--fw ID | --fw list | --bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--fps 60] [--fw-dir DIR] [--audio-ms 50] [--layout qwerty|azerty] [--midi-map FILE] [--bench MS] [--midi all|none|NAME] [--midi-ch N]");
         std::process::exit(2);
     };
     if let Some(ms) = o.shot {
@@ -729,7 +748,7 @@ fn main() {
     let mut pot = m.soc.periph.adc_value[4];
 
     let ring = Arc::new(AudioRing { q: Mutex::new(VecDeque::new()), started: AtomicBool::new(false), underruns: AtomicU64::new(0) });
-    let _stream = match start_audio(ring.clone()) {
+    let _stream = match start_audio(ring.clone(), o.audio_ms) {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("audio off: {e}");
@@ -767,7 +786,7 @@ fn main() {
                 }
                 let buffered = ring.q.lock().unwrap().len() as f64 / 88.2;
                 let behind = if audio_ok && m.soc.periph.audio_halves > 0 {
-                    buffered < AUDIO_TARGET_MS
+                    buffered < o.audio_ms
                 } else {
                     emu_ms < real + LEAD_MS
                 };
