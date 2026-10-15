@@ -207,6 +207,12 @@ impl Asm {
         }
     }
 
+    /// `cmp byte [base + index], imm8`
+    pub fn cmp_b_idx_i(&mut self, base: Reg, index: Reg, imm: u8) {
+        self.rx(None, false, &[0x80], 7, base, index);
+        self.b(imm);
+    }
+
     // ---------------------------------------------------------------- single-precision SSE
     pub fn movd_to_x(&mut self, x: u8, r: Reg) { self.rr(Some(0x66), false, &[0x0f, 0x6e], x, r, false); }
     pub fn movd_from_x(&mut self, r: Reg, x: u8) { self.rr(Some(0x66), false, &[0x0f, 0x7e], x, r, false); }
@@ -313,6 +319,13 @@ mod tests {
                 a.st_idx(4, s, b, RDX); add(&mut text, format!("mov dword ptr [{}+rdx], {}", names[b as usize], n32[s as usize]));
                 a.st_idx(2, s, b, RDX); add(&mut text, format!("mov word ptr [{}+rdx], {}", names[b as usize], ["ax", "cx", "dx"][s as usize]));
                 a.st_idx(1, s, b, RDX); add(&mut text, format!("mov byte ptr [{}+rdx], {}", names[b as usize], ["al", "cl", "dl"][s as usize]));
+            }
+        }
+        for &b in &[R10, R11, R14] {
+            for &x in &[R10, R11, RDX] {
+                if b != x {
+                    a.cmp_b_idx_i(b, x, 0); add(&mut text, format!("cmp byte ptr [{}+{}], 0", names[b as usize], names[x as usize]));
+                }
             }
         }
         for x in 0..2u8 {

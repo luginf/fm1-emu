@@ -15,6 +15,7 @@
 use fm1_soc::Action;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 
@@ -66,8 +67,21 @@ struct Inner {
     path: Option<PathBuf>,
 }
 
+/// What the bound controls did, for the window to show (the knobs turn, the keys sink with the
+/// device's): atomics the MIDI thread writes and the window reads once a frame, no lock.
+#[derive(Default)]
+pub struct Visual {
+    /// detents turned since the window last looked, per encoder
+    pub enc: [AtomicI32; 7],
+    /// the MASTER pot's new value (0..1023), -1: unchanged
+    pub pot: AtomicI32,
+    /// the keys and buttons held through the device: bit = matrix key id
+    pub held: AtomicU64,
+}
+
 pub struct Learn {
     inner: Mutex<Inner>,
+    pub visual: Visual,
 }
 
 /// Where the bindings are kept: `--midi-map FILE`, else the user's configuration directory.
@@ -118,7 +132,9 @@ impl Learn {
         if let Some(text) = inner.path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
             inner.binds = text.lines().filter_map(parse_line).collect();
         }
-        Learn { inner: Mutex::new(inner) }
+        let visual = Visual::default();
+        visual.pot.store(-1, Ordering::Relaxed);
+        Learn { inner: Mutex::new(inner), visual }
     }
 
     pub fn count(&self) -> usize {
@@ -206,6 +222,13 @@ impl Learn {
                     } else {
                         g.held.remove(&id);
                     }
+                    if id < 64 {
+                        if on {
+                            self.visual.held.fetch_or(1 << id, Ordering::Relaxed);
+                        } else {
+                            self.visual.held.fetch_and(!(1u64 << id), Ordering::Relaxed);
+                        }
+                    }
                     let _ = tx.send(Action::Key { id, down: on });
                 }
             }
@@ -223,12 +246,15 @@ impl Learn {
                     c as i32
                 };
                 if clicks != 0 {
+                    self.visual.enc[i].fetch_add(clicks, Ordering::Relaxed);
                     let _ = tx.send(Action::Enc { enc, clicks });
                 }
             }
             Target::Pot => {
                 if kind == Kind::Cc {
-                    let _ = tx.send(Action::Adc { ch: 4, value: (val as u32 * 1023 / 127) as u16 });
+                    let value = (val as u32 * 1023 / 127) as u16;
+                    self.visual.pot.store(value as i32, Ordering::Relaxed);
+                    let _ = tx.send(Action::Adc { ch: 4, value });
                 }
             }
         }
@@ -339,6 +365,27 @@ mod tests {
         assert!(l.handle(&[0xb0, 7, 26], &tx)); // -4 = -2
         let got: Vec<_> = rx.try_iter().collect();
         assert!(matches!(got[..], [Action::Enc { clicks: 5, .. }, Action::Enc { clicks: -2, .. }]), "{} actions", got.len());
+    }
+
+    #[test]
+    fn the_window_is_told_what_the_device_did() {
+        let (tx, _rx) = channel();
+        let l = learn();
+        l.toggle(Target::Enc(2));
+        l.handle(&[0xb0, 9, 0], &tx); // (the first message makes the binding)
+        l.handle(&[0xb0, 9, 0], &tx); // (the next one is the starting value)
+        l.handle(&[0xb0, 9, 6], &tx); // 3 detents
+        assert_eq!(l.visual.enc[2].swap(0, Ordering::Relaxed), 3);
+        l.toggle(Target::Pot);
+        l.handle(&[0xb0, 10, 1], &tx);
+        l.handle(&[0xb0, 10, 127], &tx);
+        assert_eq!(l.visual.pot.swap(-1, Ordering::Relaxed), 1023);
+        l.toggle(Target::Key(22));
+        l.handle(&[0x90, 60, 100], &tx); // (the binding)
+        l.handle(&[0x90, 60, 100], &tx);
+        assert_eq!(l.visual.held.load(Ordering::Relaxed), 1 << 22);
+        l.handle(&[0x80, 60, 0], &tx);
+        assert_eq!(l.visual.held.load(Ordering::Relaxed), 0);
     }
 
     #[test]

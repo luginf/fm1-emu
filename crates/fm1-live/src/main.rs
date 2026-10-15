@@ -1108,8 +1108,23 @@ fn main() {
             fb.resize(src.len(), 0);
             fb.copy_from_slice(&src);
         }
+        // what a bound control of the MIDI device did: the knobs turn, the keys sink, as on the hardware
+        for i in 0..7 {
+            let c = learn.visual.enc[i].swap(0, std::sync::atomic::Ordering::Relaxed);
+            if c != 0 {
+                enc_clicks[i] += c;
+                turning[i] = 10;
+            }
+        }
+        let p = learn.visual.pot.swap(-1, std::sync::atomic::Ordering::Relaxed);
+        if p >= 0 {
+            pot = p as u16;
+            turning[7] = 10;
+        }
+        let held = learn.visual.held.load(std::sync::atomic::Ordering::Relaxed);
+        let shown_down: [bool; 41] = std::array::from_fn(|k| down[k] || held >> k & 1 != 0);
         {
-            let st = panel::State { lcd: &fb, enc_clicks: &enc_clicks, pot, down: &down, leds: &shown_leds, turning: &turning };
+            let st = panel::State { lcd: &fb, enc_clicks: &enc_clicks, pot, down: &shown_down, leds: &shown_leds, turning: &turning };
             panel::draw(&mut buf, &base, &st);
         }
         // MIDI learn: a thin frame on what is bound, a thick orange one on what is being learned
