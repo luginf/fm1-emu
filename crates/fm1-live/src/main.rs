@@ -953,6 +953,7 @@ fn main() {
         // ---- MIDI learn: right-click a control to arm it, Del / Backspace forgets its binding
         let rpressed = win.get_mouse_down(MouseButton::Right);
         if rpressed && !was_rpressed {
+            eprintln!("MIDI learn: right click");
             if let Some((mx, my)) = pos {
                 let t = match panel::hit(mx, my) {
                     Some(Ctl::Enc(i)) => Some(midilearn::Target::Enc(i)),
@@ -960,8 +961,12 @@ fn main() {
                     Some(Ctl::Btn(id) | Ctl::Key(id)) => Some(midilearn::Target::Key(id)),
                     None => None,
                 };
-                if let Some(t) = t {
-                    learn.toggle(t);
+                match t {
+                    Some(t) => match learn.toggle(t) {
+                        Some(_) => eprintln!("MIDI learn: {} armed, now move or press a control on your MIDI device", t.describe()),
+                        None => eprintln!("MIDI learn: {} cancelled", t.describe()),
+                    },
+                    None => eprintln!("MIDI learn: nothing to bind under the pointer ({mx:.0}, {my:.0})"),
                 }
             }
         }
@@ -1019,6 +1024,13 @@ fn main() {
         {
             let st = panel::State { lcd: &fb, enc_clicks: &enc_clicks, pot, down: &down, leds: &shown_leds, turning: &turning };
             panel::draw(&mut buf, &base, &st);
+        }
+        // MIDI learn: a thin frame on what is bound, a thick orange one on what is being learned
+        for t in learn.bound_targets() {
+            panel::frame(&mut buf, t, 0xff40_c0ff, 2);
+        }
+        if let Some(t) = learn.armed() {
+            panel::frame(&mut buf, t, 0xffff_9020, 5);
         }
         if win.update_with_buffer(&buf, W, H).is_err() {
             break;

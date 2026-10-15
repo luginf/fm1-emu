@@ -124,6 +124,11 @@ impl Learn {
         self.inner.lock().unwrap().binds.len()
     }
 
+    /// The controls that have a binding.
+    pub fn bound_targets(&self) -> Vec<Target> {
+        self.inner.lock().unwrap().binds.iter().map(|b| b.target).collect()
+    }
+
     pub fn armed(&self) -> Option<Target> {
         self.inner.lock().unwrap().armed
     }
@@ -173,6 +178,7 @@ impl Learn {
             }
             g.binds.retain(|b| b.target != t && !(b.kind == kind && b.ch == ch && b.num == num));
             g.binds.push(Bind { kind, ch, num, target: t });
+            eprintln!("MIDI learn: {} {} ch {} -> {}", if kind == Kind::Cc { "CC" } else { "note" }, num, ch + 1, t.describe());
             g.armed = None;
             g.last.remove(&(ch, num));
             g.save();
