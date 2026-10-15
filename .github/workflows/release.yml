@@ -1,0 +1,99 @@
+name: Release
+
+# Builds fm1-live (the native synth) and fm1-emu (the batch runner) for Linux, Windows and
+# macOS, and attaches the archives to a GitHub release.
+#   git tag v0.1.0 && git push origin v0.1.0
+# It can also be started by hand from the Actions tab (workflow_dispatch): the archives are
+# then only kept as workflow artifacts, no release is created.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04 # old glibc, so the binaries run on most distributions
+            target: x86_64-unknown-linux-gnu
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libxcursor-dev libxrandr-dev libxi-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p fm1-live -p fm1-emu
+
+      - name: Package
+        shell: bash
+        run: |
+          NAME="fm1-emu-${{ github.ref_name }}-${{ matrix.name }}"
+          mkdir "$NAME"
+          EXT=""
+          if [ "$RUNNER_OS" = "Windows" ]; then EXT=".exe"; fi
+          for b in fm1-live fm1-emu; do
+            cp "target/${{ matrix.target }}/release/$b$EXT" "$NAME/"
+          done
+          cp README.md LICENSE "$NAME/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "$NAME.zip" "$NAME"
+            echo "ASSET=$NAME.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$NAME.tar.gz" "$NAME"
+            echo "ASSET=$NAME.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ASSET }}
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
