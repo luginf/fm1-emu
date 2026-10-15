@@ -67,11 +67,20 @@ pub struct Ctx {
     _pad: u32,
     /// the chain slot of the exit taken back to Rust (null: not a chainable exit)
     slot: *mut u64,
+    /// the bus's count of code-word writes when the call began (u64::MAX: it does not count):
+    /// a helper that sees it change ends the block, so a write to code is never run past
+    cw: u64,
+    /// instructions after which no new block may start: the interpreter's loop stops at the
+    /// budget of the call between blocks, and so must a chain of compiled ones
+    stop_at: u32,
+    _pad2: u32,
 }
 const OFF_BRK: i32 = 24;
 const OFF_SLOT: i32 = 32;
+const OFF_STOP: i32 = 48;
 const _: () = assert!(std::mem::offset_of!(Ctx, brk) == OFF_BRK as usize);
 const _: () = assert!(std::mem::offset_of!(Ctx, slot) == OFF_SLOT as usize);
+const _: () = assert!(std::mem::offset_of!(Ctx, stop_at) == OFF_STOP as usize);
 
 // ------------------------------------------------------------------ executable memory
 #[cfg(not(windows))]
@@ -126,6 +135,11 @@ pub struct Jit {
     cache: CodeCache,
     /// per block: runs counted until hot, then the compiled entry (or a failure)
     state: Vec<Entry>,
+    /// the chain slots that lead into RAM blocks (valid while the bus's code-write count is `cw`)
+    ram_links: Vec<*mut u64>,
+    cw: Option<u64>,
+    /// compile the inline stores with the check of the code-word marks (once RAM holds code)
+    checks: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -151,7 +165,7 @@ const HOT: u32 = 32;
 
 impl Jit {
     pub fn new() -> Option<Jit> {
-        Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new() })
+        Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new(), ram_links: Vec::new(), cw: None, checks: false })
     }
 
     /// The compiled code of block `id` (prefix length), compiling it once it is hot.
@@ -171,7 +185,7 @@ impl Jit {
                 let e = if plen == 0 {
                     Entry::No
                 } else {
-                    match compile::<B>(&ops[..plen], pc0, mem) {
+                    match compile::<B>(&ops[..plen], pc0, mem, self.checks) {
                         Some((code, body)) => match self.cache.write(&code) {
                             // SAFETY: body is a byte offset inside the code just written
                             Some(p) => Entry::Code(p, unsafe { p.add(body) }, plen as u32),
@@ -197,8 +211,47 @@ impl Jit {
         }
     }
 
+    /// Code was written since the RAM links were made: cut them all (the next exit to Rust
+    /// finds the blocks again, checked). Call before running compiled code.
+    pub fn note_code_writes(&mut self, cw: Option<u64>) {
+        if cw != self.cw {
+            for &s in &self.ram_links {
+                // SAFETY: slots are leaked u64s owned by compiled code, valid for the program's life
+                unsafe { *s = 0 };
+            }
+            self.ram_links.clear();
+            self.cw = cw;
+        }
+    }
+
+    /// Are there links into RAM blocks (so code writes must be watched)?
+    pub fn tracking(&self) -> bool {
+        !self.ram_links.is_empty()
+    }
+
+    /// Do the stores compiled from now on check the code-word marks?
+    pub fn checks_on(&self) -> bool {
+        self.checks
+    }
+
+    /// RAM holds code: from now on stores are compiled with the check of its marks, and what was
+    /// compiled without it is dropped (once; the marks never go away).
+    pub fn set_store_checks(&mut self, on: bool) {
+        if on && !self.checks {
+            self.checks = true;
+            self.reset();
+        }
+    }
+
+    /// A chain slot now leads into a RAM block, checked while the bus's code-write count was `cw`.
+    pub fn link_ram(&mut self, slot: *mut u64, cw: Option<u64>) {
+        self.note_code_writes(cw);
+        self.ram_links.push(slot);
+    }
+
     /// Forget every compiled block (the block table was rebuilt).
     pub fn reset(&mut self) {
+        self.ram_links.clear();
         self.state.clear();
         self.cache.used = 0;
     }
@@ -208,10 +261,10 @@ impl Jit {
 ///
 /// # Safety
 /// `code` must come from `Jit::entry` for this bus type and the memory `mem` describes.
-pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, mem: &JitMem, extra: u32) -> (u32, *mut u64) {
+pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, mem: &JitMem, extra: u32, budget_left: u32, track: bool) -> (u32, *mut u64) {
     // instructions this call may run: their ticks ((k - 1) + extra) must all fit tick_room
     let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30) as u32;
-    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, _pad: 0, slot: std::ptr::null_mut() };
+    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, _pad: 0, slot: std::ptr::null_mut(), cw: if track { bus.code_writes().unwrap_or(u64::MAX) } else { u64::MAX }, stop_at: budget_left, _pad2: 0 };
     let f: extern "C" fn(*mut Cpu, *mut Ctx, *mut u8, *const u8, u32) -> u32 = unsafe { std::mem::transmute(code) };
     let k = f(cpu as *mut Cpu, &mut ctx, mem.ram, mem.xip, limit);
     if k > 0 {
@@ -247,7 +300,16 @@ extern "C" fn h_read<B: Bus>(ctx: *mut Ctx, addr: u32, idx: u32, w: u32) -> u32 
     if bus.next_tick_due() {
         ctx.brk = 1;
     }
+    // (the ticks the helper applied ran the peripherals, which can write code too)
+    note_code_write(ctx, bus);
     v
+}
+
+/// The bus counted a write to a code word since the call began: leave after this instruction.
+fn note_code_write<B: Bus>(ctx: &mut Ctx, bus: &B) {
+    if ctx.cw != u64::MAX && bus.code_writes().is_some_and(|w| w != ctx.cw) {
+        ctx.brk = 1;
+    }
 }
 
 extern "C" fn h_write<B: Bus>(ctx: *mut Ctx, addr: u32, v: u32, idx: u32, w: u32) {
@@ -263,6 +325,7 @@ extern "C" fn h_write<B: Bus>(ctx: *mut Ctx, addr: u32, v: u32, idx: u32, w: u32
     if bus.next_tick_due() {
         ctx.brk = 1;
     }
+    note_code_write(ctx, bus);
 }
 
 /// Any op through the interpreter's own executor: bit 32 = jumped (target in the low word).
@@ -276,6 +339,7 @@ extern "C" fn h_op<B: Bus>(ctx: *mut Ctx, op: *const Fast, idx: u32, next_pc: u3
     if bus.next_tick_due() {
         ctx.brk = 1;
     }
+    note_code_write(ctx, bus);
     match j {
         Some(t) => (1u64 << 32) | t as u64,
         None => 0,
@@ -314,6 +378,8 @@ const FRAME: i32 = 56;
 struct Gen<'a> {
     a: Asm,
     mem: &'a JitMem,
+    /// stores check the code-word marks
+    checks: bool,
     exit: Label,
     h_read: u64,
     h_write: u64,
@@ -552,6 +618,14 @@ impl Gen<'_> {
         self.a.alu_i(Alu::Sub, W2, mem.ram_base as i32);
         self.a.alu_i(Alu::Cmp, W2, mem.ram_len.saturating_sub(w as u32) as i32);
         self.a.jcc(Cc::A, slow);
+        if self.checks && !mem.ram_code.is_null() {
+            // a word that holds code goes through the bus: it counts the write, and the block ends
+            self.a.mov(R11, W2);
+            self.a.shift_i(Sh::Shr, R11, 2);
+            self.a.mov_i64(R10, mem.ram_code as u64);
+            self.a.cmp_b_idx_i(R10, R11, 0);
+            self.a.jcc(Cc::Ne, slow);
+        }
         self.a.st_idx(w, W1, RAM, W2);
         self.a.jmp(done);
         self.a.bind(slow);
@@ -589,12 +663,13 @@ impl Gen<'_> {
 
 /// Native code for a block prefix of plain micro-ops (none careful): the code bytes and the
 /// offset of the body (the chain target).
-fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u8>, usize)> {
+fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, checks: bool) -> Option<(Vec<u8>, usize)> {
     let mut a = Asm::new();
     let exit = a.label();
     let mut g = Gen {
         a,
         mem,
+        checks,
         exit,
         h_read: h_read::<B> as usize as u64,
         h_write: h_write::<B> as usize as u64,
@@ -638,6 +713,16 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u8
         g.a.jcc(Cc::Be, fits);
         g.exit_imm(pc0, 0);
         g.a.bind(fits);
+        // (a block starts only while the call's budget is not spent, as in the interpreter's
+        // loop: needed once chains reach into RAM code, which the other core shares)
+        if g.checks {
+            let go = g.a.label();
+            g.a.ld(R10, CTX, OFF_STOP);
+            g.a.alu(Alu::Cmp, DONE, R10);
+            g.a.jcc(Cc::B, go);
+            g.exit_imm(pc0, 0);
+            g.a.bind(go);
+        }
     }
 
     let mut pc = pc0;
@@ -1049,6 +1134,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u8
                 bus_used = true;
                 if other.may_jump() {
                     // a branch through the interpreter (the float compares) that fell through
+                    g.check_brk(next_pc, count);
                     g.chain(next_pc, count);
                 }
             }

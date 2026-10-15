@@ -67,10 +67,27 @@ release. A workflow run without a tag (workflow_dispatch) only keeps artifacts. 
   but push, tag and release only when the user asked.
 - Never run `find /` (the user's disk is huge); use `locate` or a bounded directory.
 
+## RAM code in the x86 JIT (done, v0.2.4)
+
+Firmwares whose code runs from RAM (Melodee, M-VAVE's own on cpu1) chain compiled blocks through RAM
+like XIP ones. Safety rests on the bus's code-write count (`Bus::code_writes`, the RAM's per-word code
+marks): every inline store checks the mark of its word and goes through the bus if set (the bus counts
+it and the block ends: `Ctx.cw`, `note_code_write`); any change of the count cuts all the RAM links
+(`Jit::note_code_writes`). A block over RAM is vouched for by `bver` (the count) instead of a byte compare.
+All this only when RAM code is hot (`Cpu::ram_hot`: rate of RAM block entries and average block length
+over ~100 ms; then `Bus::code_watch`, shared by both cores): the check costs 5-10% on stores, so firmwares
+without RAM code (Felucca, most) keep the exact code and speed of v0.2.3. A compiled chain also stops at
+the call's instruction budget (`Ctx.stop_at`, as the interpreter's loop does), or the two cores interleave
+differently and the dual-core stock firmware's audio differs from the interpreter's.
+Results (i5-4430, 240 MHz): Melodee 0.41x -> 0.8x, M-VAVE stock 0.95x -> 1.1x.
+
+fm1doom, zp12 and obervave (0.4-0.5x) are NOT RAM-bound: they spend their time polling two unmodeled
+registers (0x13e08, 0x13e0c: probably a flash / DMA controller they use to read data), through the slow
+memory path (`Soc::region` -> Unknown). Fixing it means modelling that hardware, not the JIT.
+
 ## Not done yet (ideas, in the order I would take them)
 
-1. JIT: chain into RAM blocks (melodee 0.42x, fm1doom 0.48x, zp12 0.52x, obervave 0.38x are the slow
-   ones: their code runs from RAM and every block re-checks its bytes). Mind code written to RAM.
+1. Model the registers at 0x13e08 / 0x13e0c (see above) so the three slow firmwares stop spinning.
 2. JIT: inline Div, FOp min/max/conversions, float compares, IfBlk with else.
 3. Panel drawing cost (sinf per knob each frame): precompute.
 4. An issue for upstream drafted in `dist/upstream-issue.md` (not posted).

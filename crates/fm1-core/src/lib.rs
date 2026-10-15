@@ -98,6 +98,18 @@ pub trait Bus {
     }
     /// RAM bytes lo..hi hold code a block was built from: count writes to them from now on.
     fn code_mark(&mut self, _lo: u32, _hi: u32) {}
+    /// Is the stores' check of the code marks required (a core found its RAM code hot)? Only ever
+    /// goes from false to true, for both cores at once: until then a JIT may leave the check out,
+    /// and the CPU may not trust the write count to tell that RAM code is unchanged.
+    fn code_watched(&self) -> bool {
+        false
+    }
+    /// Require the check (see `code_watched`).
+    fn code_watch(&mut self) {}
+    /// The bus's clock, in cycles (0: it has none).
+    fn cycles(&self) -> u64 {
+        0
+    }
 }
 
 /// The RAM from `pc` to its end, when the bus can show it (its JIT memory map), and pc is in it.
@@ -130,6 +142,16 @@ fn same_bytes(a: &[u8], b: &[u8]) -> bool {
         a == b
     }
 }
+
+/// RAM block entries to count before judging, and the rate (per million cycles) from which a
+/// firmware's RAM code counts as hot (Melodee 9000, M-VAVE's own 17500, X0X 12000 but its blocks
+/// are 3 instructions on average, the others 0).
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+const RAM_HOT: u32 = 20_000;
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+const RAM_RATE: u64 = 8_000;
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+const RAM_WINDOW: u64 = 24_000_000;
 
 /// CPU architectural state.
 #[derive(Debug, Default)]
@@ -216,8 +238,17 @@ pub struct Cpu {
     bbytes: Vec<Option<Box<[u8]>>>,
     /// Per block over RAM, in the wasm build: the bus's count of code-word writes when the block
     /// was last found current (`ram_block_ok`: the same count, no compare).
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows"))))]
     bver: Vec<u64>,
+    /// x86-64: entries into RAM blocks so far (RAM code that is hot switches the write checks on)
+    #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+    ram_entries: u32,
+    /// x86-64: the bus's clock when the RAM entries being counted began
+    #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+    ram_since: u64,
+    /// x86-64: the instructions of those RAM blocks
+    #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+    ram_insns: u64,
     /// FM1_NO_RAM_BLOCKS: RAM code a step at a time (the reference)
     no_ram_blocks: bool,
     /// Instructions per execute route (index 31 = the micro-op fast path),
@@ -388,6 +419,11 @@ impl Cpu {
         let mut pc = self.pc;
         let mut synced = 0u32;
         let jit_mem = if self.jit_on { bus.jit_mem() } else { None };
+        // (the other core may have required the stores' check since this one last ran)
+        #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+        if self.jit_on {
+            self.watch_if_asked(bus);
+        }
         macro_rules! sync {
             () => {{
                 self.pc = pc;
@@ -417,6 +453,13 @@ impl Cpu {
                 if let Some(mem) = jit_mem {
                     if self.jit.is_none() {
                         self.jit = jit::Jit::new().map(Box::new);
+                        #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+                        self.watch_if_asked(bus);
+                    }
+                    // RAM code that is run a lot is worth chaining (see `ram_hot`)
+                    #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+                    if !(0x0200_0000..0x0400_0000).contains(&pc) {
+                        self.ram_hot(bus, len);
                     }
                     let code = match self.jit.as_mut() {
                         Some(j) => j.entry::<B>(id, &self.bops[start as usize..(start + len) as usize], pc, &mem),
@@ -426,18 +469,45 @@ impl Cpu {
                         // (the code checks itself that its ticks fall before anything is due)
                         let extra = if n == 0 { 0 } else { 1 };
                         sync!();
+                        // (a code write since the RAM blocks were linked cuts those links)
+                        #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+                        let track = match self.jit.as_mut() {
+                            Some(j) if j.tracking() => {
+                                j.note_code_writes(bus.code_writes());
+                                j.tracking()
+                            }
+                            _ => false,
+                        };
                         // SAFETY: code was compiled for this bus type and memory map
+                        #[cfg(not(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows"))))]
                         let (k, slot) = unsafe { jit::run(code, self, bus, &mem, extra) };
+                        #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+                        let (k, slot) = unsafe { jit::run(code, self, bus, &mem, extra, budget.saturating_sub(n).max(1), track) };
                         if k > 0 {
                             n += k;
                             pc = self.pc;
                             // (it left between the two instructions of a glued pair)
                             careful = self.hold_irq != 0;
+                            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
                             if !slot.is_null() {
                                 // a chainable exit came back: link it once its target is compiled
                                 if let Some(body) = self.jit_body_at(pc) {
                                     // SAFETY: slots are leaked u64s owned by the compiled code
                                     unsafe { *slot = body as u64 };
+                                }
+                            }
+                            #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+                            if !slot.is_null() {
+                                // a chainable exit came back: link it once its target is compiled
+                                // (a RAM block too, while no code word has been written since it was checked)
+                                if let Some((body, ram)) = self.jit_link_target(bus, pc) {
+                                    // SAFETY: slots are leaked u64s owned by the compiled code
+                                    unsafe { *slot = body as u64 };
+                                    if ram {
+                                        if let Some(j) = self.jit.as_mut() {
+                                            j.link_ram(slot, bus.code_writes());
+                                        }
+                                    }
                                 }
                             }
                             continue;
@@ -624,8 +694,14 @@ impl Cpu {
     /// JIT's inline stores go past that count: the bytes are compared every time.)
     #[inline]
     fn ram_block_ok<B: Bus>(&mut self, bus: &mut B, id: usize) -> bool {
+        // (the write count is trusted where every write is counted: the browser's JIT checks the
+        // marks itself, the x86-64 one once it is told to, and no JIT at all counts them all)
         #[cfg(target_arch = "wasm32")]
-        if let Some(w) = bus.code_writes() {
+        let trust = true;
+        #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+        let trust = !self.jit_on || self.jit.as_ref().is_some_and(|j| j.checks_on());
+        #[cfg(any(target_arch = "wasm32", all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows"))))]
+        if let Some(w) = bus.code_writes().filter(|_| trust) {
             if self.bver[id] == w {
                 return true;
             }
@@ -649,7 +725,7 @@ impl Cpu {
     }
 
     /// The compiled body of the block starting at pc, if there is one.
-    #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows"))))]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     fn jit_body_at(&self, pc: u32) -> Option<*const u8> {
         // RAM blocks are entered only through block_at, which checks their bytes first
         if self.bmap.is_empty() || !(0x0200_0000..0x0400_0000).contains(&pc) {
@@ -660,6 +736,74 @@ impl Cpu {
             return None;
         }
         self.jit.as_ref()?.body(id as usize - 1)
+    }
+
+    /// x86-64: RAM code that is run a lot (a firmware's synth on cpu1, say) is worth chaining, and
+    /// the CPU may then trust the write count to tell it unchanged. For that every store, of both
+    /// cores, must look at the code marks, which costs a little: so only for such firmwares (and
+    /// the code compiled without the check is dropped). Called at each RAM block entry: it
+    /// counts them, and judges over a stretch of about 100 ms (a burst at boot is no rate) by their
+    /// rate, and by their length: 3.8 instructions on average at least, as chaining pays on code
+    /// that runs on from block to block, not on a polling loop.
+    #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+    #[inline(never)]
+    fn ram_hot<B: Bus>(&mut self, bus: &mut B, len: u32) {
+        self.ram_entries += 1;
+        self.ram_insns += len as u64;
+        if self.ram_entries == 1 {
+            self.ram_since = bus.cycles();
+            self.ram_insns = len as u64;
+        } else if self.ram_entries >= RAM_HOT {
+            let dt = bus.cycles().saturating_sub(self.ram_since);
+            if dt >= RAM_WINDOW {
+                if self.ram_entries as u64 * 1_000_000 >= RAM_RATE * dt && self.ram_insns * 5 >= self.ram_entries as u64 * 19 {
+                    bus.code_watch();
+                    self.watch_if_asked(bus);
+                } else {
+                    self.ram_entries = 0;
+                }
+            }
+        }
+    }
+
+    /// x86-64: switch this core's JIT to checked stores once the bus requires them.
+    #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+    fn watch_if_asked<B: Bus>(&mut self, bus: &mut B) {
+        if let Some(j) = self.jit.as_mut() {
+            if !j.checks_on() && bus.code_watched() {
+                j.set_store_checks(true);
+                // (what the count vouched for while stores were unchecked is checked again)
+                self.bver.iter_mut().for_each(|v| *v = u64::MAX);
+            }
+        }
+    }
+
+    /// x86-64: the compiled body of the block at pc to chain into, and whether it is a RAM block.
+    /// A RAM block is linked only when it is current and the bus counts the writes to code words
+    /// (the JIT's inline stores check the words' flags, so every write is counted): any such write
+    /// cuts all the links into RAM again (`Jit::note_code_writes`).
+    #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+    fn jit_link_target<B: Bus>(&mut self, bus: &mut B, pc: u32) -> Option<(*const u8, bool)> {
+        if self.bmap.is_empty() {
+            return None;
+        }
+        let id = self.bmap[(pc >> 1) as usize & (self.bmap.len() - 1)];
+        if id == 0 || self.blocks[id as usize - 1].0 != pc {
+            return None;
+        }
+        let id = id as usize - 1;
+        let xip = (0x0200_0000..0x0400_0000).contains(&pc);
+        if !xip {
+            // (only where every store checks the marks: else a chain could outlive a code write)
+            if !self.jit.as_ref()?.checks_on() {
+                return None;
+            }
+            bus.code_writes()?;
+            if !self.ram_block_ok(bus, id) {
+                return None;
+            }
+        }
+        self.jit.as_ref()?.body(id).map(|b| (b, !xip))
     }
 
     #[inline(never)]
@@ -673,7 +817,7 @@ impl Cpu {
             self.bops.clear();
             self.blocks.clear();
             self.bbytes.clear();
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(any(target_arch = "wasm32", all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows"))))]
             self.bver.clear();
             self.bmap.iter_mut().for_each(|x| *x = 0);
             #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows"))))]
@@ -729,7 +873,7 @@ impl Cpu {
         }
         self.bbytes.resize(self.blocks.len() - 1, None);
         self.bbytes.push(bytes);
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(any(target_arch = "wasm32", all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows"))))]
         {
             self.bver.resize(self.blocks.len() - 1, u64::MAX);
             self.bver.push(bus.code_writes().unwrap_or(u64::MAX));

@@ -55,6 +55,15 @@ impl Bus for Core1Bus<'_> {
     fn code_mark(&mut self, lo: u32, hi: u32) {
         self.soc.code_mark(lo, hi)
     }
+    fn code_watched(&self) -> bool {
+        self.soc.code_watched()
+    }
+    fn code_watch(&mut self) {
+        self.soc.code_watch()
+    }
+    fn cycles(&self) -> u64 {
+        self.soc.periph.cycles
+    }
     fn tick_room(&self) -> u64 {
         self.budget.saturating_sub(1)
     }

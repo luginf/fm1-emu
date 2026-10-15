@@ -10,6 +10,8 @@ pub struct Ram {
     /// Writes to code words so far: while it stays the same, no block built from RAM can have
     /// changed (the CPU skips comparing their bytes with memory).
     pub code_writes: u64,
+    /// The stores' check of the marks is required (never goes back; `Bus::code_watch`).
+    pub watched: bool,
 }
 
 impl Ram {
@@ -18,6 +20,7 @@ impl Ram {
             data: vec![0; size],
             code: vec![0; size / 4 + 1],
             code_writes: 0,
+            watched: false,
         }
     }
 

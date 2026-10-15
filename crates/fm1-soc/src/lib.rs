@@ -500,6 +500,15 @@ impl Bus for Soc {
     fn code_mark(&mut self, lo: u32, hi: u32) {
         self.ram.mark_code(lo.wrapping_sub(RAM_BASE), hi.wrapping_sub(RAM_BASE));
     }
+    fn code_watched(&self) -> bool {
+        self.ram.watched
+    }
+    fn code_watch(&mut self) {
+        self.ram.watched = true;
+    }
+    fn cycles(&self) -> u64 {
+        self.periph.cycles
+    }
     #[inline]
     fn tick_room(&self) -> u64 {
         self.periph.tick_room()
