@@ -90,4 +90,5 @@ memory path (`Soc::region` -> Unknown). Fixing it means modelling that hardware,
 1. Model the registers at 0x13e08 / 0x13e0c (see above) so the three slow firmwares stop spinning.
 2. JIT: inline Div, FOp min/max/conversions, float compares, IfBlk with else.
 3. Panel drawing cost (sinf per knob each frame): precompute.
-4. An issue for upstream drafted in `dist/upstream-issue.md` (not posted).
+4. The issue for upstream (text in `dist/upstream-issue.md`) was posted by Alan himself; if upstream answers, the fork's
+   state is described there. Upstream has 3 plugin commits not merged yet (`git fetch upstream`).
