@@ -167,7 +167,7 @@ pub fn disc(buf: &mut [u32], cx: f32, cy: f32, r: f32, f: impl Fn(f32, f32) -> u
 }
 
 /// 5x7 glyphs, one byte per column, bit 0 at the top.
-fn glyph(c: char) -> [u8; 5] {
+pub fn glyph(c: char) -> [u8; 5] {
     match c {
         '0' => [0x3E, 0x51, 0x49, 0x45, 0x3E], '1' => [0x00, 0x42, 0x7F, 0x40, 0x00],
         '2' => [0x42, 0x61, 0x51, 0x49, 0x46], '3' => [0x21, 0x41, 0x45, 0x4B, 0x31],

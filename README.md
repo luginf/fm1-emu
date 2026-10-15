@@ -122,6 +122,11 @@ cargo run --release -p fm1-live -- --fw felucca         # a window with the synt
 cargo run --release -p fm1-live -- --fwsc FM-1.fwsc     # M-VAVE's own, from its package
 ```
 
+Started with no argument (a double-click on the AppImage), `fm1-live` opens a **launcher**: the catalog's
+firmwares in a list (a green dot: already downloaded, the others are fetched when you start them), M-VAVE's own
+firmware (`--fw mvave` takes `FM-1.fwsc` from the firmware directory, or from M-VAVE's server), and the options
+(keyboard layout, window refresh, audio buffer, clock, MIDI input and channel). `fm1-live --help` lists every option.
+
 The computer keyboard plays the notes (`A W S E D F T G Y H U J K O L P ; '` = C4..F5, `Z`/`X` octave,
 `Space` PLAY, `R` REC, `1`..`0` the buttons); `--layout azerty` moves them to the same places on an AZERTY
 keyboard (`Q Z S E D ... M`, `W`/`X` octave, `F1`..`F10` the buttons). **MIDI learn**: right-click a knob,

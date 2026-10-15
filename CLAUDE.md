@@ -18,7 +18,8 @@ node tools/readme_firmwares.mjs --check         # CI checks the README table aga
 
 `fm1-live` options worth knowing: `--fetch [ID ...]`, `--fw ID|list`, `--fw-dir`, `--fwsc FILE`
 (M-VAVE's own package), `--fps`, `--audio-ms`, `--mhz`, `--layout azerty`, `--midi-map FILE`,
-`--midi-reset`, `--bench MS`. Env: `FM1_NO_JIT=1` (the interpreter, the reference),
+`--midi-reset`, `--bench MS`, `--help`. With no argument: the launcher window (`launcher.rs`,
+`--launcher-shot FILE.ppm` renders it to a file so it can be looked at without a window). Env: `FM1_NO_JIT=1` (the interpreter, the reference),
 `FM1_BENCH_WAV=file.raw` (bench writes the audio), `FM1_BENCH_TRACE=1` (checkpoints per 100k instructions).
 
 ## The JIT (crates/fm1-core)

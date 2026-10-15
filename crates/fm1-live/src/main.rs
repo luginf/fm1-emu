@@ -24,6 +24,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use fm1_core::{Bus, Cpu};
 use fm1_soc::{machine, Action, Soc, VEC_BASE};
 mod fetch;
+mod launcher;
 mod midilearn;
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use panel::{Ctl, ENCS, H, W};
@@ -74,11 +75,17 @@ struct Opts {
     midi_reset: bool,
 }
 
+impl Opts {
+    fn new() -> Opts {
+        Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
+                       name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0, fps: 60,
+                       fw_dir: "reference/firmwares".into(), azerty: false, midi_map: None, midi_reset: false, audio_ms: AUDIO_TARGET_MS }
+    }
+}
+
 fn parse() -> Option<Opts> {
     let a: Vec<String> = std::env::args().collect();
-    let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
-                       name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0, fps: 60,
-                       fw_dir: "reference/firmwares".into(), azerty: false, midi_map: None, midi_reset: false, audio_ms: AUDIO_TARGET_MS };
+    let mut o = Opts::new();
     // (before the rest, whatever the order: the directory the firmwares are in)
     if let Some(p) = a.iter().position(|x| x == "--fw-dir") {
         o.fw_dir = a.get(p + 1)?.clone();
@@ -754,9 +761,50 @@ fn midi_inputs(o: &Opts, tx: &mpsc::Sender<Action>, learn: &Arc<midilearn::Learn
 /// Pixels of vertical mouse drag per encoder click.
 const DRAG_PER_CLICK: f32 = 12.0;
 
+const USAGE: &str = "\
+fm1-live: the emulated M-VAVE FM-1 in a window, with sound. Without any argument it opens a
+launcher: a list of firmwares (downloaded when needed) and the options.
+
+Firmware (one of):
+  --fw ID              a firmware of the catalog, downloaded when missing (`--fw list` lists them);
+                       `--fw mvave` is M-VAVE's own, taken from the firmware directory or its server
+  --fw FILE.fwsc       an update package, community or M-VAVE's (the same as --fwsc FILE.fwsc)
+  --fwsc FILE.fwsc     an update package (M-VAVE's own FM-1.fwsc, an SMK-37 package, ...)
+  --bin FILE           an app image loaded at --entry (default 0x02000120): reference/firmwares/ID.xip.bin
+  --syx FILE           a DX7 bank (.syx) for M-VAVE's firmware
+Downloads:
+  --fetch [ID ...]     download the catalog's firmwares (all, or those listed) and leave
+  --fw-dir DIR         where they are kept (default reference/firmwares)
+Window and sound:
+  --fps N              window refresh rate (default 60)
+  --audio-ms N         sound kept queued ahead, in ms (default 50; lower = less delay, more risk of cracks)
+  --mhz N              emulated clock (default 240; lower it when the computer cannot keep up)
+  --layout qwerty|azerty   the computer keyboard (azerty: Q Z S E D F T G Y H U J K O L P M, W/X octave, F1..F10 buttons)
+MIDI:
+  --midi all|none|NAME the MIDI inputs to use (default all)      --midi-ch N   force the channel (1..16)
+  --midi-map FILE      where the MIDI learn bindings are kept    --midi-reset  forget them at start
+  (MIDI learn: right-click a control in the window, then move one on your device; Del forgets it, Shift+Del all)
+Tests:
+  --bench MS           run MS emulated milliseconds without a window and print the speed
+  --shot MS            run MS ms and write the screen as an image
+  -h, --help           this text
+Environment: FM1_NO_JIT=1 runs the interpreter instead of the JIT.
+";
+
 fn main() {
-    let Some(o) = parse() else {
-        eprintln!("usage: fm1-live [--fetch [ID ...]] [--fw ID | --fw list | --bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--fps 60] [--fw-dir DIR] [--audio-ms 50] [--layout qwerty|azerty] [--midi-map FILE] [--midi-reset] [--bench MS] [--midi all|none|NAME] [--midi-ch N]");
+    if std::env::args().any(|a| a == "-h" || a == "--help") {
+        print!("{USAGE}");
+        return;
+    }
+    if let Some(p) = std::env::args().position(|a| a == "--launcher-shot") {
+        return launcher::shot(&std::env::args().nth(p + 1).unwrap_or_else(|| "launcher.ppm".into()));
+    }
+    let parsed = if std::env::args().len() == 1 { launcher::run() } else { parse() };
+    let Some(o) = parsed else {
+        if std::env::args().len() == 1 {
+            return; // (the launcher was closed)
+        }
+        eprint!("{USAGE}");
         std::process::exit(2);
     };
     if let Some(ms) = o.shot {
@@ -1080,7 +1128,7 @@ fn main() {
                 Some(t) => format!(" | MIDI LEARN {}: move or press a control (was: {}), Del forgets", t.describe(), learn.bound_to(t).unwrap_or_else(|| "none".into())),
                 None => String::new(),
             };
-            win.set_title(&format!("FM-1 · {} — {}{l}", o.name, status.lock().unwrap()));
+            win.set_title(&format!("FM-1 · {} - {}{l}", o.name, status.lock().unwrap()));
             shown_armed = armed;
             last_title = Instant::now();
         }
@@ -1256,7 +1304,7 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
             break;
         }
         if last_title.elapsed() >= Duration::from_millis(500) {
-            win.set_title(&format!("SMK-37 · {} — {}", o.name, status.lock().unwrap()));
+            win.set_title(&format!("SMK-37 · {} - {}", o.name, status.lock().unwrap()));
             last_title = Instant::now();
         }
     }
