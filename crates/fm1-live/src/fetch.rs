@@ -29,6 +29,8 @@ pub struct Entry {
     pub installer: Option<String>,
     pub manifest: Option<String>,
     pub embedded: Option<String>,
+    /// where a bring-your-own package comes from (M-VAVE's own server)
+    pub download: Option<String>,
 }
 
 /// The catalog compiled into the binary.
@@ -48,6 +50,7 @@ pub fn catalog() -> Vec<Entry> {
                     installer: s(f, "installer"),
                     manifest: s(f, "manifest"),
                     embedded: s(f, "embedded"),
+                    download: s(f, "download"),
                 })
                 .collect()
         })
@@ -154,6 +157,25 @@ fn embedded_package(page: &str, var: &str) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// M-VAVE's own package (a `byo` entry): `<dir>/<id>.fwsc`, else an `FM-1.fwsc` in `dir` or in
+/// the current directory, else downloaded from the vendor's server into `<dir>/<id>.fwsc`
+/// (a browser cannot do that, its server does not allow other pages; this program can).
+pub fn stock_package(e: &Entry, dir: &Path) -> Result<std::path::PathBuf, String> {
+    let own = dir.join(format!("{}.fwsc", e.id));
+    for p in [own.clone(), dir.join("FM-1.fwsc"), Path::new("FM-1.fwsc").to_path_buf()] {
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    let url = e.download.as_deref().ok_or("no download URL in the catalog")?;
+    eprintln!("{}: downloading M-VAVE's package from its server ({url})", e.id);
+    let bytes = get_bytes(url)?;
+    fm1_soc::fwsc::unpack(&bytes).map_err(|m| format!("{url}: not an FM-1 package ({m})"))?;
+    std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    std::fs::write(&own, &bytes).map_err(|err| format!("{}: {err}", own.display()))?;
+    Ok(own)
 }
 
 /// The package of a catalog entry and the URL it came from.

@@ -103,13 +103,37 @@ fn parse() -> Option<Opts> {
                 let cat = fetch::catalog();
                 let dir = std::path::Path::new(&o.fw_dir);
                 if want == "list" {
-                    for e in cat.iter().filter(|e| !e.byo) {
-                        let have = if dir.join(format!("{}.xip.bin", e.id)).exists() { "" } else { "  (not downloaded: --fetch)" };
+                    for e in cat.iter() {
+                        let have = if e.byo {
+                            if dir.join(format!("{}.fwsc", e.id)).exists() { "" } else { "  (M-VAVE's own: --fw downloads it from its server)" }
+                        } else if dir.join(format!("{}.xip.bin", e.id)).exists() { "" } else { "  (not downloaded: --fetch)" };
                         println!("{:14} {} {}{have}", e.id, e.name, e.version);
                     }
                     std::process::exit(0);
                 }
-                let e = cat.into_iter().find(|e| &e.id == want && !e.byo)?;
+                // a package file given by its path
+                if want.to_lowercase().ends_with(".fwsc") && std::path::Path::new(want).is_file() {
+                    o.fwsc = Some(want.clone());
+                    o.name = "M-VAVE package".into();
+                    i += 2;
+                    continue;
+                }
+                let e = cat.into_iter().find(|e| &e.id == want)?;
+                if e.byo {
+                    // M-VAVE's own firmware: the package from the firmware directory, or its server
+                    match fetch::stock_package(&e, dir) {
+                        Ok(p) => {
+                            o.fwsc = Some(p.to_string_lossy().into_owned());
+                            o.name = e.name.clone();
+                        }
+                        Err(m) => {
+                            eprintln!("{}: {m} (put FM-1.fwsc in {} or use --fwsc FILE)", e.id, dir.display());
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
                 let path = dir.join(format!("{}.xip.bin", e.id));
                 if !path.exists() {
                     eprintln!("{}: downloading into {}", e.id, dir.display());
